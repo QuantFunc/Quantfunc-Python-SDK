@@ -1550,3 +1550,804 @@ def test_mutation_m8_l2_request_isolation(tmp_path: Path, monkeypatch: pytest.Mo
             assert "av_conds" not in lib_h.sessions[-1]["options"]
     finally:
         mh.close()
+
+
+# ── Test 43 (U-C01): All 4 models 0-sync _context_fingerprint, in-place, >16 ABA fallback ──
+
+
+def test_context_fingerprint_zero_sync_all_models(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_item = torch.Tensor.item
+    item_calls = {"n": 0}
+
+    def _forbid_item(self: torch.Tensor) -> Any:
+        item_calls["n"] += 1
+        raise AssertionError("Tensor.item() must NOT be called on the 0-sync _context_fingerprint fast path")
+
+    # Build all 4 models with torch_dtype=bfloat16 while passing float32 caller contexts
+    # to force internal .to(dtype=act_dtype) allocations on every forward() call.
+    lib_k, lib_q, lib_l, lib_h = FakeQFLib(), FakeQFLib(), FakeQFLib(), FakeQFLib(echo_scale=1.0)
+    ckpt_k = _make_dummy_checkpoint(tmp_path / "fp_krea2.safetensors")
+    ckpt_q = _make_dummy_checkpoint(tmp_path / "fp_qi21.safetensors")
+    ckpt_l = _make_dummy_checkpoint(
+        tmp_path / "fp_ltx25.safetensors",
+        tensor_keys=[
+            "model.diffusion_model.video_embeddings_connector.w",
+            "model.diffusion_model.audio_embeddings_connector.w",
+        ],
+    )
+    ckpt_h = _make_dummy_checkpoint(tmp_path / "fp_h3.safetensors")
+
+    mk = QuantFuncKrea2Transformer2DModel.from_pretrained(ckpt_k, lib=lib_k, torch_dtype=torch.bfloat16)
+    mq = QuantFuncQwenImage21Transformer2DModel.from_pretrained(ckpt_q, lib=lib_q, torch_dtype=torch.bfloat16)
+    ml = QuantFuncLTX25Transformer3DModel.from_pretrained(ckpt_l, lib=lib_l, torch_dtype=torch.bfloat16)
+    mh = QuantFuncMiniMaxH3Transformer3DModel.from_pretrained(ckpt_h, lib=lib_h, torch_dtype=torch.bfloat16)
+    try:
+        # 1. Forbid Tensor.item() across all 4 models' steady-state + in-place mutation forward passes
+        monkeypatch.setattr(torch.Tensor, "item", _forbid_item)
+
+        # (a) Krea-2: FP32 -> BF16 cast + middle-padded encoder_attention_mask (triggers torch.stack every step)
+        xk = torch.randn(1, 64, 2, 2, dtype=torch.bfloat16)
+        ck = torch.randn(1, 5, 12, 2560, dtype=torch.float32)
+        mask_k = torch.tensor([[1, 1, 0, 0, 1]], dtype=torch.long)
+        mk(xk, encoder_hidden_states=ck, encoder_attention_mask=mask_k, timestep=0.9)
+        mk(xk, encoder_hidden_states=ck, encoder_attention_mask=mask_k, timestep=0.5)
+        assert [s["cfg_context_key"] for s in lib_k.steps[-2:]] == [1, 1]
+        # In-place mutation bumps _version -> MUST rotate cfg_context_key without calling .item()
+        ck.mul_(2.0)
+        mk(xk, encoder_hidden_states=ck, encoder_attention_mask=mask_k, timestep=0.4)
+        assert lib_k.steps[-1]["cfg_context_key"] == 2
+        # In-place mutation on encoder_attention_mask also rotates key
+        mask_k.copy_(torch.tensor([[1, 0, 1, 0, 1]], dtype=torch.long))
+        mk(xk, encoder_hidden_states=ck, encoder_attention_mask=mask_k, timestep=0.3)
+        assert lib_k.steps[-1]["cfg_context_key"] == 3
+
+        # (b) Qwen-Image-2.1: FP32 -> BF16 cast stable key + in-place rotation
+        xq = torch.randn(1, 64, 4, 4, dtype=torch.bfloat16)
+        cq = torch.randn(1, 6, 4096, dtype=torch.float32)
+        mq(xq, encoder_hidden_states=cq, timestep=0.9)
+        mq(xq, encoder_hidden_states=cq, timestep=0.5)
+        assert [s["cfg_context_key"] for s in lib_q.steps[-2:]] == [1, 1]
+        cq.mul_(3.0)
+        mq(xq, encoder_hidden_states=cq, timestep=0.5)
+        # Note: split-CFG guard reopens session at ratio 1.0 when a 2nd key appears, proving key rotated!
+        assert len(lib_q.sessions) == 2
+
+        # (c) LTX-2.5: FP32 -> BF16 + (v_ctx, a_ctx) torch.cat every step -> stable key 1, in-place rotates!
+        vl = torch.randn(1, 128, 2, 2, 2, dtype=torch.bfloat16)
+        al = torch.randn(1, 8, 4, 16, dtype=torch.float32)
+        vc = torch.randn(1, 4, 4096, dtype=torch.float32)
+        ac = torch.randn(1, 4, 2048, dtype=torch.float32)
+        ml(vl, audio_hidden_states=al, encoder_hidden_states=vc, audio_encoder_hidden_states=ac, timestep=0.9)
+        ml(vl, audio_hidden_states=al, encoder_hidden_states=vc, audio_encoder_hidden_states=ac, timestep=0.5)
+        assert [s["cfg_context_key"] for s in lib_l.steps[-2:]] == [1, 1]
+        ac.mul_(2.0)
+        ml(vl, audio_hidden_states=al, encoder_hidden_states=vc, audio_encoder_hidden_states=ac, timestep=0.4)
+        assert lib_l.steps[-1]["cfg_context_key"] == 2
+        vc.mul_(0.5)
+        ml(vl, audio_hidden_states=al, encoder_hidden_states=vc, audio_encoder_hidden_states=ac, timestep=0.3)
+        assert lib_l.steps[-1]["cfg_context_key"] == 3
+
+        # (d) MiniMax-H3: FP32 -> BF16 stable key + in-place rotation
+        vh = torch.ones(1, 24, 2, 4, 4, dtype=torch.bfloat16)
+        ah = torch.ones(1, 32, 2, 3, dtype=torch.float32)
+        ch = torch.randn(1, 4, 5120, dtype=torch.float32)
+        mh(vh, audio_hidden_states=ah, encoder_hidden_states=ch, timestep=0.2)
+        mh(vh, audio_hidden_states=ah, encoder_hidden_states=ch, timestep=0.5)
+        assert [s["cfg_context_key"] for s in lib_h.steps[-2:]] == [1, 1]
+        ch.mul_(2.0)
+        mh(vh, audio_hidden_states=ah, encoder_hidden_states=ch, timestep=0.6)
+        assert lib_h.steps[-1]["cfg_context_key"] == 2
+
+        # (e) cache_context override stays 0-sync
+        with mk.cache_context("explicit_cond"):
+            assert mk._context_fingerprint(ck, 0) == ("explicit_cond", 0)
+
+        assert item_calls["n"] == 0
+
+        # 2. end_session_if_open() clears _session_ctx_keepalive on all 4 models
+        for model in (mk, mq, ml, mh):
+            assert len(model._session_ctx_keepalive) > 0
+            model.end_session_if_open()
+            assert model._session_ctx_keepalive == {}
+
+        # 3. Overflow (>16 distinct data_ptr) falls back to 3-scalar ("val", ...) WITHOUT evicting keepalive
+        monkeypatch.undo()
+        counted_items = {"n": 0}
+        sum_calls = {"n": 0}
+        real_sum = torch.Tensor.sum
+
+        def _count_item(self: torch.Tensor) -> Any:
+            counted_items["n"] += 1
+            return real_item(self)
+
+        def _count_sum(self: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
+            sum_calls["n"] += 1
+            return real_sum(self, *args, **kwargs)
+
+        monkeypatch.setattr(torch.Tensor, "item", _count_item)
+        monkeypatch.setattr(torch.Tensor, "sum", _count_sum)
+
+        first_16 = [torch.full((1, 4, 16), float(idx + 1), dtype=torch.float32) for idx in range(16)]
+        fps_16 = [mk._context_fingerprint(t, 0) for t in first_16]
+        assert counted_items["n"] == 0
+        assert sum_calls["n"] == 0
+        assert len(mk._session_ctx_keepalive) == 16
+        assert len(set(fps_16)) == 16
+        assert all(fp[0] == "ptr" for fp in fps_16)
+        kept_ptrs = set(mk._session_ctx_keepalive.keys())
+
+        # 17th and 18th distinct tensors overflow -> no eviction, no ABA collision, 3 scalar items each, 0 sum()
+        t17 = torch.tensor([[[100.0, 200.0, 300.0]]], dtype=torch.float32)
+        t18 = torch.tensor([[[100.0, 250.0, 300.0]]], dtype=torch.float32)
+        fp17 = mk._context_fingerprint(t17, 0)
+        assert counted_items["n"] == 3
+        assert sum_calls["n"] == 0
+        assert fp17[0] == "val"
+        assert set(mk._session_ctx_keepalive.keys()) == kept_ptrs  # zero eviction!
+        assert fp17 not in set(fps_16)
+
+        fp18 = mk._context_fingerprint(t18, 0)
+        assert counted_items["n"] == 6
+        assert sum_calls["n"] == 0
+        assert fp18[0] == "val"
+        assert fp18 != fp17  # mid element distinguishes them
+        assert set(mk._session_ctx_keepalive.keys()) == kept_ptrs
+
+        # Re-querying one of the first 16 still hits 0-sync "ptr" fast path with identical key
+        assert mk._context_fingerprint(first_16[0], 0) == fps_16[0]
+        assert counted_items["n"] == 6
+
+        # _release_scratch() also clears keepalive
+        mk._release_scratch()
+        assert mk._session_ctx_keepalive == {}
+    finally:
+        mk.close()
+        mq.close()
+        ml.close()
+        mh.close()
+
+
+# ── Test 43b: torch.inference_mode() 0-sync _context_fingerprint across all 4 models ──
+
+
+def test_context_fingerprint_inference_mode_all_models(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify 0-sync _context_fingerprint across all 4 models under torch.inference_mode()."""
+    item_calls = {"n": 0}
+
+    def _forbid_item(self: torch.Tensor) -> Any:
+        item_calls["n"] += 1
+        raise AssertionError("Tensor.item() must NOT be called on the 0-sync _context_fingerprint fast path")
+
+    lib_k, lib_q, lib_l, lib_h = FakeQFLib(), FakeQFLib(), FakeQFLib(), FakeQFLib(echo_scale=1.0)
+    ckpt_k = _make_dummy_checkpoint(tmp_path / "inf_krea2.safetensors")
+    ckpt_q = _make_dummy_checkpoint(tmp_path / "inf_qi21.safetensors")
+    ckpt_l = _make_dummy_checkpoint(
+        tmp_path / "inf_ltx25.safetensors",
+        tensor_keys=[
+            "model.diffusion_model.video_embeddings_connector.w",
+            "model.diffusion_model.audio_embeddings_connector.w",
+        ],
+    )
+    ckpt_h = _make_dummy_checkpoint(tmp_path / "inf_h3.safetensors")
+
+    mk = QuantFuncKrea2Transformer2DModel.from_pretrained(ckpt_k, lib=lib_k, torch_dtype=torch.bfloat16)
+    mq = QuantFuncQwenImage21Transformer2DModel.from_pretrained(ckpt_q, lib=lib_q, torch_dtype=torch.bfloat16)
+    ml = QuantFuncLTX25Transformer3DModel.from_pretrained(ckpt_l, lib=lib_l, torch_dtype=torch.bfloat16)
+    mh = QuantFuncMiniMaxH3Transformer3DModel.from_pretrained(ckpt_h, lib=lib_h, torch_dtype=torch.bfloat16)
+    try:
+        monkeypatch.setattr(torch.Tensor, "item", _forbid_item)
+
+        with torch.inference_mode():
+            # (a) Krea-2: inference_mode encoder_hidden_states + encoder_attention_mask
+            xk = torch.randn(1, 64, 2, 2, dtype=torch.bfloat16)
+            ck1 = torch.randn(1, 5, 12, 2560, dtype=torch.float32)
+            ck2 = torch.randn(1, 5, 12, 2560, dtype=torch.float32)
+            mask_k1 = torch.tensor([[1, 1, 0, 0, 1]], dtype=torch.long)
+            mask_k2 = torch.tensor([[1, 0, 1, 0, 1]], dtype=torch.long)
+            assert ck1.is_inference() and mask_k1.is_inference()
+            mk(xk, encoder_hidden_states=ck1, encoder_attention_mask=mask_k1, timestep=0.9)
+            mk(xk, encoder_hidden_states=ck1, encoder_attention_mask=mask_k1, timestep=0.5)
+            assert [s["cfg_context_key"] for s in lib_k.steps[-2:]] == [1, 1]
+            mk(xk, encoder_hidden_states=ck2, encoder_attention_mask=mask_k1, timestep=0.4)
+            assert lib_k.steps[-1]["cfg_context_key"] == 2
+            mk(xk, encoder_hidden_states=ck2, encoder_attention_mask=mask_k2, timestep=0.3)
+            assert lib_k.steps[-1]["cfg_context_key"] == 3
+
+            # (b) Qwen-Image-2.1: inference_mode encoder_hidden_states + split-CFG reopen + rotation
+            xq = torch.randn(1, 64, 4, 4, dtype=torch.bfloat16)
+            cq1 = torch.randn(1, 6, 4096, dtype=torch.float32)
+            cq2 = torch.randn(1, 6, 4096, dtype=torch.float32)
+            assert cq1.is_inference()
+            mq(xq, encoder_hidden_states=cq1, timestep=0.9)
+            mq(xq, encoder_hidden_states=cq1, timestep=0.5)
+            assert [s["cfg_context_key"] for s in lib_q.steps[-2:]] == [1, 1]
+            mq(xq, encoder_hidden_states=cq2, timestep=0.4)
+            assert len(lib_q.sessions) == 2
+            mq(xq, encoder_hidden_states=cq1, timestep=0.3)
+            assert lib_q.steps[-1]["cfg_context_key"] == 2
+
+            # (c) LTX-2.5: inference_mode encoder_hidden_states + audio_encoder_hidden_states
+            vl = torch.randn(1, 128, 2, 2, 2, dtype=torch.bfloat16)
+            al = torch.randn(1, 8, 4, 16, dtype=torch.float32)
+            vc1 = torch.randn(1, 4, 4096, dtype=torch.float32)
+            vc2 = torch.randn(1, 4, 4096, dtype=torch.float32)
+            ac1 = torch.randn(1, 4, 2048, dtype=torch.float32)
+            ac2 = torch.randn(1, 4, 2048, dtype=torch.float32)
+            assert vc1.is_inference() and ac1.is_inference()
+            ml(vl, audio_hidden_states=al, encoder_hidden_states=vc1, audio_encoder_hidden_states=ac1, timestep=0.9)
+            ml(vl, audio_hidden_states=al, encoder_hidden_states=vc1, audio_encoder_hidden_states=ac1, timestep=0.5)
+            assert [s["cfg_context_key"] for s in lib_l.steps[-2:]] == [1, 1]
+            ml(vl, audio_hidden_states=al, encoder_hidden_states=vc1, audio_encoder_hidden_states=ac2, timestep=0.4)
+            assert lib_l.steps[-1]["cfg_context_key"] == 2
+            ml(vl, audio_hidden_states=al, encoder_hidden_states=vc2, audio_encoder_hidden_states=ac2, timestep=0.3)
+            assert lib_l.steps[-1]["cfg_context_key"] == 3
+
+            # (d) MiniMax-H3: inference_mode encoder_hidden_states
+            vh = torch.ones(1, 24, 2, 4, 4, dtype=torch.bfloat16)
+            ah = torch.ones(1, 32, 2, 3, dtype=torch.float32)
+            ch1 = torch.randn(1, 4, 5120, dtype=torch.float32)
+            ch2 = torch.randn(1, 4, 5120, dtype=torch.float32)
+            assert ch1.is_inference()
+            mh(vh, audio_hidden_states=ah, encoder_hidden_states=ch1, timestep=0.2)
+            mh(vh, audio_hidden_states=ah, encoder_hidden_states=ch1, timestep=0.5)
+            assert [s["cfg_context_key"] for s in lib_h.steps[-2:]] == [1, 1]
+            mh(vh, audio_hidden_states=ah, encoder_hidden_states=ch2, timestep=0.6)
+            assert lib_h.steps[-1]["cfg_context_key"] == 2
+
+        # (e) Inference tensors passed into forward() outside torch.inference_mode() (TextEncoder -> caller pattern)
+        mk(torch.randn(1, 64, 2, 2, dtype=torch.bfloat16), encoder_hidden_states=ck1, encoder_attention_mask=mask_k1, timestep=0.2)
+        assert lib_k.steps[-1]["cfg_context_key"] == 1
+
+        # (f) Explicit cache_context remains 0-sync for inference tensors
+        with mk.cache_context("explicit_inf"):
+            assert mk._context_fingerprint(ck1, 0) == ("explicit_inf", 0)
+
+        # (g) Distinguish inference tensor (ver == -1) vs normal tensor (ver >= 0) at same data_ptr & shape
+        shared_buf = bytearray(1 * 4 * 2560 * 4)
+        t_norm = torch.frombuffer(shared_buf, dtype=torch.float32).reshape(1, 4, 2560)
+        with torch.inference_mode():
+            t_inf = torch.frombuffer(shared_buf, dtype=torch.float32).reshape(1, 4, 2560)
+        assert t_norm.data_ptr() == t_inf.data_ptr()
+        assert t_norm.shape == t_inf.shape
+        assert t_norm.stride() == t_inf.stride()
+        assert not t_norm.is_inference()
+        assert t_inf.is_inference()
+
+        mk.end_session_if_open()
+        fp_norm = mk._context_fingerprint(t_norm, 0)
+        fp_inf = mk._context_fingerprint(t_inf, 0)
+        assert fp_norm[0] == "ptr" and fp_inf[0] == "ptr"
+        assert fp_norm[1][0][1] >= 0
+        assert fp_inf[1][0][1] == -1
+        assert fp_norm != fp_inf
+
+        # End-to-end forward() rotation between same-address/same-shape normal vs inference tensor
+        mk.end_session_if_open()
+        xk_shared = torch.randn(1, 64, 2, 2, dtype=torch.bfloat16)
+        mk(xk_shared, encoder_hidden_states=t_norm, timestep=0.9)
+        mk(xk_shared, encoder_hidden_states=t_inf, timestep=0.5)
+        assert [s["cfg_context_key"] for s in lib_k.steps[-2:]] == [1, 2]
+        assert item_calls["n"] == 0
+
+        # (h) Overflow fallback (>16 distinct data_ptr) works cleanly on inference tensors
+        monkeypatch.undo()
+        mk.end_session_if_open()
+        for idx in range(16):
+            mk._context_fingerprint(torch.full((1, 2, 4), float(idx + 1)), 0)
+        with torch.inference_mode():
+            t_inf_overflow = torch.tensor([[[10.0, 20.0, 30.0]]], dtype=torch.float32)
+        fp_overflow = mk._context_fingerprint(t_inf_overflow, 0)
+        assert fp_overflow == ("val", (((1, 1, 3), torch.float32, (10.0, 20.0, 30.0)),), 0)
+    finally:
+        mk.close()
+        mq.close()
+        ml.close()
+        mh.close()
+
+
+# ── Test 44 (U-C04): Vectorized LTX-2.5 video & audio timestep validation (<=1 D2H) ──
+
+
+def test_ltx25_timestep_vectorized_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lib = FakeQFLib()
+    ckpt = _make_dummy_checkpoint(
+        tmp_path / "ltx25_vec_ts.safetensors",
+        tensor_keys=[
+            "model.diffusion_model.video_embeddings_connector.w",
+            "model.diffusion_model.audio_embeddings_connector.w",
+        ],
+    )
+    ml = QuantFuncLTX25Transformer3DModel.from_pretrained(ckpt, lib=lib, torch_dtype=torch.float32)
+
+    real_tolist = torch.Tensor.tolist
+    tolist_calls = {"n": 0}
+
+    def _forbid_item(self: torch.Tensor) -> Any:
+        raise AssertionError("Tensor.item() must NOT be called in vectorized LTX-2.5 timestep validation")
+
+    def _spy_tolist(self: torch.Tensor) -> Any:
+        tolist_calls["n"] += 1
+        return real_tolist(self)
+
+    monkeypatch.setattr(torch.Tensor, "item", _forbid_item)
+    monkeypatch.setattr(torch.Tensor, "tolist", _spy_tolist)
+
+    try:
+        # 1. 0D & 1D video/audio timesteps: <=1 tolist D2H, 0 .item()
+        tolist_calls["n"] = 0
+        s0, sc0 = ml._extract_video_sigma_and_frame_scales(torch.tensor(500.0), None, batch=1, ppf=16, pph=2, ppw=2)
+        assert tolist_calls["n"] <= 1
+        assert s0 == pytest.approx([0.5]) and sc0 is None
+
+        tolist_calls["n"] = 0
+        s1, sc1 = ml._extract_video_sigma_and_frame_scales(
+            torch.tensor([800.0, 400.0]), None, batch=2, ppf=16, pph=2, ppw=2
+        )
+        assert tolist_calls["n"] <= 1
+        assert s1 == pytest.approx([0.8, 0.4]) and sc1 is None
+
+        tolist_calls["n"] = 0
+        a1 = ml._extract_audio_frame_scales(torch.tensor([0.5]), [0.5], batch=1, audio_rows=16)
+        assert tolist_calls["n"] <= 1
+        assert a1 is None
+
+        # 2. Multi-dim I2V video (F=16, H=2, W=2) & audio (La=16): STRICTLY 1 D2H each, 0 .item()
+        f_count = 16
+        expected_vid_scales = [round(i / (f_count - 1), 4) for i in range(f_count)]
+        vid_t_2d = torch.tensor(
+            [[sc * 1000.0 for sc in expected_vid_scales for _ in range(4)]],
+            dtype=torch.float32,
+        )
+        tolist_calls["n"] = 0
+        sv, vid_scales = ml._extract_video_sigma_and_frame_scales(
+            vid_t_2d, None, batch=1, ppf=f_count, pph=2, ppw=2
+        )
+        assert tolist_calls["n"] == 1
+        assert sv == pytest.approx([1.0])
+        assert vid_scales == pytest.approx(expected_vid_scales, abs=1e-4)
+
+        # 5D video timestep [B=1, C=1, F=16, H=2, W=2]
+        vid_t_5d = vid_t_2d.reshape(1, 1, f_count, 2, 2)
+        tolist_calls["n"] = 0
+        sv5, vid_scales5 = ml._extract_video_sigma_and_frame_scales(
+            vid_t_5d, None, batch=1, ppf=f_count, pph=2, ppw=2
+        )
+        assert tolist_calls["n"] == 1
+        assert sv5 == pytest.approx([1.0])
+        assert vid_scales5 == pytest.approx(expected_vid_scales, abs=1e-4)
+
+        # Multi-dim audio timestep [B=1, La=16, 4] & 4D [B=1, 8, La=16, 16]
+        expected_aud_scales = [0.0 if i < 4 else 1.0 if i >= 12 else 0.5 for i in range(f_count)]
+        aud_t_3d = torch.tensor(
+            [[[sc * 1000.0] * 4 for sc in expected_aud_scales]],
+            dtype=torch.float32,
+        )
+        tolist_calls["n"] = 0
+        aud_scales = ml._extract_audio_frame_scales(aud_t_3d, [1.0], batch=1, audio_rows=f_count)
+        assert tolist_calls["n"] == 1
+        assert aud_scales == pytest.approx(expected_aud_scales)
+
+        aud_t_4d = torch.zeros(1, 8, f_count, 16, dtype=torch.float32)
+        for r, sc in enumerate(expected_aud_scales):
+            aud_t_4d[:, :, r, :] = sc * 1000.0
+        tolist_calls["n"] = 0
+        aud_scales4 = ml._extract_audio_frame_scales(aud_t_4d, [1.0], batch=1, audio_rows=f_count)
+        assert tolist_calls["n"] == 1
+        assert aud_scales4 == pytest.approx(expected_aud_scales)
+
+        # 3. All 5 negative categories on BOTH video and audio (NaN, +Inf, -Inf mixed, negative, intra-frame variance, batch mismatch)
+        # (a) NaN
+        bad_nan_v = vid_t_2d.clone()
+        bad_nan_v[0, 5] = float("nan")
+        with pytest.raises(ValueError, match="finite"):
+            ml._extract_video_sigma_and_frame_scales(bad_nan_v, None, batch=1, ppf=f_count, pph=2, ppw=2)
+
+        bad_nan_a = aud_t_3d.clone()
+        bad_nan_a[0, 3, 2] = float("nan")
+        with pytest.raises(ValueError, match="finite"):
+            ml._extract_audio_frame_scales(bad_nan_a, [1.0], batch=1, audio_rows=f_count)
+
+        # (b) +Inf and -Inf mixed with positive (lo=-inf, hi=positive specifically kills missing isfinite(lo) check!)
+        bad_pinf_v = vid_t_2d.clone()
+        bad_pinf_v[0, 4] = float("inf")
+        with pytest.raises(ValueError, match="finite"):
+            ml._extract_video_sigma_and_frame_scales(bad_pinf_v, None, batch=1, ppf=f_count, pph=2, ppw=2)
+
+        bad_ninf_v = torch.ones(1, f_count * 4, dtype=torch.float32)
+        bad_ninf_v[0, 4] = float("-inf")
+        with pytest.raises(ValueError, match="finite"):
+            ml._extract_video_sigma_and_frame_scales(bad_ninf_v, None, batch=1, ppf=f_count, pph=2, ppw=2)
+
+        bad_pinf_a = aud_t_3d.clone()
+        bad_pinf_a[0, 1, 0] = float("inf")
+        with pytest.raises(ValueError, match="finite"):
+            ml._extract_audio_frame_scales(bad_pinf_a, [1.0], batch=1, audio_rows=f_count)
+
+        bad_ninf_a = torch.ones(1, f_count, 4, dtype=torch.float32)
+        bad_ninf_a[0, 2, 1] = float("-inf")
+        with pytest.raises(ValueError, match="finite"):
+            ml._extract_audio_frame_scales(bad_ninf_a, [1.0], batch=1, audio_rows=f_count)
+
+        # 1D NaN / Inf / negative
+        with pytest.raises(ValueError, match="finite"):
+            ml._extract_video_sigma_and_frame_scales(torch.tensor([float("nan")]), None, batch=1, ppf=4, pph=2, ppw=2)
+        with pytest.raises(ValueError, match="non-negative"):
+            ml._extract_video_sigma_and_frame_scales(torch.tensor([-0.1]), None, batch=1, ppf=4, pph=2, ppw=2)
+        with pytest.raises(ValueError, match="finite"):
+            ml._extract_audio_frame_scales(torch.tensor([float("inf")]), [0.5], batch=1, audio_rows=4)
+        with pytest.raises(ValueError, match="non-negative"):
+            ml._extract_audio_frame_scales(torch.tensor([-0.1]), [0.5], batch=1, audio_rows=4)
+
+        # (c) Negative finite value
+        bad_neg_v = vid_t_2d.clone()
+        bad_neg_v[0, 0] = -0.25
+        with pytest.raises(ValueError, match="non-negative"):
+            ml._extract_video_sigma_and_frame_scales(bad_neg_v, None, batch=1, ppf=f_count, pph=2, ppw=2)
+
+        bad_neg_a = aud_t_3d.clone()
+        bad_neg_a[0, 0, 0] = -0.25
+        with pytest.raises(ValueError, match="non-negative"):
+            ml._extract_audio_frame_scales(bad_neg_a, [1.0], batch=1, audio_rows=f_count)
+
+        # (d) Intra-frame / intra-row variance > 1e-4
+        bad_var_v = vid_t_2d.clone()
+        bad_var_v[0, 4] += 10.0  # frame 1 element 0 diverges from elements 1..3
+        with pytest.raises(ValueError, match="within latent frame"):
+            ml._extract_video_sigma_and_frame_scales(bad_var_v, None, batch=1, ppf=f_count, pph=2, ppw=2)
+
+        bad_var_a = aud_t_3d.clone()
+        bad_var_a[0, 5, 0] = 0.0  # row 5 diverges
+        with pytest.raises(ValueError, match="within audio row"):
+            ml._extract_audio_frame_scales(bad_var_a, [1.0], batch=1, audio_rows=f_count)
+
+        # (e) Batch scale mismatch (batch=2)
+        b2_vid = torch.cat([vid_t_2d, torch.ones_like(vid_t_2d) * 1000.0], dim=0)
+        with pytest.raises(ValueError, match="must match across batch"):
+            ml._extract_video_sigma_and_frame_scales(b2_vid, None, batch=2, ppf=f_count, pph=2, ppw=2)
+
+        b2_aud = torch.cat([aud_t_3d, torch.ones_like(aud_t_3d) * 1000.0], dim=0)
+        with pytest.raises(ValueError, match="must match across batch"):
+            ml._extract_audio_frame_scales(b2_aud, [1.0, 1.0], batch=2, audio_rows=f_count)
+
+        # 4. Additional branch coverage: 1D + sigma_override, empty 1D, 1D len < batch, 2D [B, F],
+        #    multi-dim + tensor/scalar sigma_override, invalid 5D / non-5D, scalar audio, audio shapes,
+        #    all-zero denom == 0.0, and full-denoise >= 0.9999 -> None.
+        sv_ov1, sc_ov1 = ml._extract_video_sigma_and_frame_scales(
+            torch.tensor([500.0]), torch.tensor([250.0]), batch=1, ppf=f_count, pph=2, ppw=2
+        )
+        assert sv_ov1 == pytest.approx([0.25]) and sc_ov1 is None
+
+        with pytest.raises(ValueError, match="non-empty"):
+            ml._extract_video_sigma_and_frame_scales(torch.tensor([]), None, batch=1, ppf=f_count, pph=2, ppw=2)
+        with pytest.raises(ValueError, match="does not match batch size"):
+            ml._extract_video_sigma_and_frame_scales(
+                torch.tensor([500.0, 400.0]), None, batch=3, ppf=f_count, pph=2, ppw=2
+            )
+        with pytest.raises(ValueError, match="multi-dim video_timestep batch"):
+            ml._extract_video_sigma_and_frame_scales(
+                torch.ones(2, f_count * 4), None, batch=1, ppf=f_count, pph=2, ppw=2
+            )
+        with pytest.raises(ValueError, match="per-item shape"):
+            ml._extract_video_sigma_and_frame_scales(
+                torch.ones(1, 1, 3, 2, 2), None, batch=1, ppf=5, pph=2, ppw=2
+            )
+        with pytest.raises(ValueError, match="per-item shape"):
+            ml._extract_video_sigma_and_frame_scales(
+                torch.ones(1, 3), None, batch=1, ppf=f_count, pph=2, ppw=2
+            )
+
+        # 2D [B, F] + scalar sigma_override and batch=2 tensor sigma_override
+        vid_bf = torch.tensor([[sc * 1000.0 for sc in expected_vid_scales]], dtype=torch.float32)
+        sv_bf, sc_bf = ml._extract_video_sigma_and_frame_scales(
+            vid_bf, 800.0, batch=1, ppf=f_count, pph=2, ppw=2
+        )
+        assert sv_bf == pytest.approx([0.8])
+        assert sc_bf == pytest.approx([min(1.0, (sc * 1000.0) / 800.0) for sc in expected_vid_scales], abs=1e-4)
+
+        vid_bf_b2 = vid_bf.repeat(2, 1)
+        sv_bf_b2, sc_bf_b2 = ml._extract_video_sigma_and_frame_scales(
+            vid_bf_b2, torch.tensor([1000.0, 1000.0]), batch=2, ppf=f_count, pph=2, ppw=2
+        )
+        assert sv_bf_b2 == pytest.approx([1.0, 1.0])
+        assert sc_bf_b2 == pytest.approx(expected_vid_scales, abs=1e-4)
+
+        # Video all-zero (denom == 0.0 -> 1.0 scales -> None) & near-1.0 (>= 0.9999 -> None)
+        sv_zero, sc_zero = ml._extract_video_sigma_and_frame_scales(
+            torch.zeros(1, f_count), None, batch=1, ppf=f_count, pph=2, ppw=2
+        )
+        assert sv_zero == pytest.approx([0.0]) and sc_zero is None
+        vid_full = torch.full((1, f_count), 1000.0, dtype=torch.float32)
+        vid_full[0, 0] = 999.95
+        sv_full, sc_full = ml._extract_video_sigma_and_frame_scales(
+            vid_full, None, batch=1, ppf=f_count, pph=2, ppw=2
+        )
+        assert sv_full == pytest.approx([1.0]) and sc_full is None
+
+        # Audio: scalar Python float, batch mismatch, [B, audio_rows], non-canonical % audio_rows == 0,
+        # invalid shape, all-zero denom == 0.0, and full denoise >= 0.9999 -> None
+        assert ml._extract_audio_frame_scales(0.5, [0.5], batch=1, audio_rows=f_count) is None
+        with pytest.raises(ValueError, match="audio_timestep batch"):
+            ml._extract_audio_frame_scales(aud_t_3d.repeat(2, 1, 1), [1.0], batch=1, audio_rows=f_count)
+        assert ml._extract_audio_frame_scales(
+            torch.tensor([[sc * 1000.0 for sc in expected_aud_scales]]), [1.0], batch=1, audio_rows=f_count
+        ) == pytest.approx(expected_aud_scales)
+        aud_noncanon = torch.tensor(
+            [[sc * 1000.0 for sc in expected_aud_scales for _ in range(4)]],
+            dtype=torch.float32,
+        ).reshape(1, f_count, 2, 2)
+        assert ml._extract_audio_frame_scales(aud_noncanon, [1.0], batch=1, audio_rows=f_count) == pytest.approx(
+            expected_aud_scales
+        )
+        with pytest.raises(ValueError, match="does not align with audio_rows"):
+            ml._extract_audio_frame_scales(torch.ones(1, 3), [1.0], batch=1, audio_rows=f_count)
+        assert ml._extract_audio_frame_scales(
+            torch.zeros(1, f_count, 4), [0.0], batch=1, audio_rows=f_count
+        ) is None
+        aud_full = torch.full((1, f_count, 4), 1000.0, dtype=torch.float32)
+        aud_full[0, 0, :] = 999.95
+        assert ml._extract_audio_frame_scales(aud_full, [1.0], batch=1, audio_rows=f_count) is None
+    finally:
+        ml.close()
+
+
+# ── Test 45: Keepalive lifecycle (Tier-2 18-round, Tier-3, OOM/pre-step, meta), stride & batch=2 ──
+
+
+def test_context_fingerprint_lifecycle_stride_and_error_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lib_k, lib_q, lib_l, lib_h = FakeQFLib(), FakeQFLib(), FakeQFLib(), FakeQFLib(echo_scale=1.0)
+    ckpt_k = _make_dummy_checkpoint(tmp_path / "lc_krea2.safetensors")
+    ckpt_q = _make_dummy_checkpoint(tmp_path / "lc_qi21.safetensors")
+    ckpt_l = _make_dummy_checkpoint(
+        tmp_path / "lc_ltx25.safetensors",
+        tensor_keys=[
+            "model.diffusion_model.video_embeddings_connector.w",
+            "model.diffusion_model.audio_embeddings_connector.w",
+        ],
+    )
+    ckpt_h = _make_dummy_checkpoint(tmp_path / "lc_h3.safetensors")
+
+    mk = QuantFuncKrea2Transformer2DModel.from_pretrained(ckpt_k, lib=lib_k, torch_dtype=torch.float32)
+    mq = QuantFuncQwenImage21Transformer2DModel.from_pretrained(ckpt_q, lib=lib_q, torch_dtype=torch.float32)
+    ml = QuantFuncLTX25Transformer3DModel.from_pretrained(ckpt_l, lib=lib_l, torch_dtype=torch.float32)
+    mh = QuantFuncMiniMaxH3Transformer3DModel.from_pretrained(ckpt_h, lib=lib_h, torch_dtype=torch.float32)
+    try:
+        # 1. _extract_batch_sigmas: empty, batch > 1, len < batch
+        with pytest.raises(ValueError, match="non-empty"):
+            mk._extract_batch_sigmas(torch.tensor([]), 1)
+        assert mk._extract_batch_sigmas(torch.tensor([0.9, 0.5]), 2) == pytest.approx([0.9, 0.5])
+        with pytest.raises(ValueError, match="does not match batch size"):
+            mk._extract_batch_sigmas(torch.tensor([0.9, 0.5]), 3)
+
+        # 2. Overflow n == 0 empty tensor in _context_fingerprint
+        for idx in range(16):
+            mk._context_fingerprint(torch.full((1, 2, 4), float(idx + 1)), 0)
+        assert mk._context_fingerprint(torch.empty(0, dtype=torch.float32), 0) == (
+            "val",
+            (((0,), torch.float32, (0.0, 0.0, 0.0)),),
+            0,
+        )
+        mk._session_ctx_keepalive.clear()
+
+        # 3. Transposed view m1 vs m1.t() non-collision (same data_ptr, _version, shape, dtype, device; diff stride!)
+        m1 = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+        m2 = m1.t()
+        assert m1.data_ptr() == m2.data_ptr()
+        assert m1.shape == m2.shape
+        assert m1.stride() != m2.stride()
+        assert mk._context_fingerprint(m1, 0) != mk._context_fingerprint(m2, 0)
+        mk._session_ctx_keepalive.clear()
+
+        # End-to-end square 4D Krea-2 transposed prompt rotates cfg_context_key from 1 -> 2
+        xk_sq = torch.randn(1, 64, 2, 2, dtype=torch.float32)
+        ck_sq = torch.arange(1 * 12 * 12 * 2560, dtype=torch.float32).reshape(1, 12, 12, 2560)
+        ck_sq_t = ck_sq.transpose(1, 2)
+        assert ck_sq.data_ptr() == ck_sq_t.data_ptr()
+        assert ck_sq.shape == ck_sq_t.shape
+        assert ck_sq.stride() != ck_sq_t.stride()
+        mk(xk_sq, encoder_hidden_states=ck_sq, timestep=0.9)
+        mk(xk_sq, encoder_hidden_states=ck_sq_t, timestep=0.9)
+        assert [s["cfg_context_key"] for s in lib_k.steps[-2:]] == [1, 2]
+        mk.end_session_if_open()
+        lib_k.sessions.clear()
+        lib_k.steps.clear()
+
+        # 4. batch=2 0-sync across all 4 models + optional second ctx None on krea2/ltx25
+        item_calls = {"n": 0}
+
+        def _forbid_item(self: torch.Tensor) -> Any:
+            item_calls["n"] += 1
+            raise AssertionError("Tensor.item() forbidden in 0-sync forward path")
+
+        monkeypatch.setattr(torch.Tensor, "item", _forbid_item)
+
+        # Krea-2 batch=2, encoder_attention_mask=None
+        out_k2 = mk(
+            torch.randn(2, 64, 2, 2),
+            encoder_hidden_states=torch.randn(2, 4, 2560),
+            encoder_attention_mask=None,
+            timestep=torch.tensor([0.9, 0.8]),
+        ).sample
+        assert out_k2.shape == (2, 64, 2, 2)
+
+        # Qwen-Image-2.1 batch=2
+        out_q2 = mq(
+            torch.randn(2, 64, 4, 4),
+            encoder_hidden_states=torch.randn(2, 4, 4096),
+            timestep=torch.tensor([0.9, 0.8]),
+        ).sample
+        assert out_q2.shape == (2, 64, 4, 4)
+
+        # LTX-2.5 batch=2, audio_encoder_hidden_states=None & video-only (audio_hidden_states=None)
+        out_l2 = ml(
+            torch.randn(2, 128, 2, 2, 2),
+            audio_hidden_states=torch.randn(2, 8, 4, 16),
+            encoder_hidden_states=torch.randn(2, 4, 4096),
+            audio_encoder_hidden_states=None,
+            timestep=torch.tensor([0.9, 0.8]),
+        )
+        assert out_l2[0].shape == (2, 128, 2, 2, 2)
+        out_l_vid_only = ml(
+            torch.randn(1, 128, 2, 2, 2),
+            audio_hidden_states=None,
+            encoder_hidden_states=torch.randn(1, 4, 4096),
+            audio_encoder_hidden_states=None,
+            timestep=0.9,
+        ).sample
+        assert out_l_vid_only.shape == (1, 128, 2, 2, 2)
+
+        # MiniMax-H3 batch=2
+        out_h2 = mh(
+            torch.ones(2, 24, 2, 4, 4),
+            audio_hidden_states=torch.ones(2, 32, 2, 3),
+            encoder_hidden_states=torch.randn(2, 4, 5120),
+            timestep=0.25,
+        )
+        assert out_h2[0].shape == (2, 24, 2, 4, 4)
+        assert item_calls["n"] == 0
+
+        # 5. Tier-2 18-round auto-reopen keepalive reset: 0 .item() on round 17/18, consistent cfg_context_key=1
+        mk.end_session_if_open()
+        lib_k.sessions.clear()
+        lib_k.steps.clear()
+        xk1 = torch.randn(1, 64, 2, 2)
+        for _rnd in range(18):
+            prompt_r = torch.randn(1, 4, 2560)
+            mk(xk1, encoder_hidden_states=prompt_r, timestep=0.9)
+            assert len(mk._session_ctx_keepalive) == 1
+            assert lib_k.steps[-1]["cfg_context_key"] == 1
+            mk(xk1, encoder_hidden_states=prompt_r, timestep=0.5)
+            assert len(mk._session_ctx_keepalive) == 1
+            assert lib_k.steps[-1]["cfg_context_key"] == 1
+        assert len(lib_k.sessions) == 18
+        assert item_calls["n"] == 0
+        monkeypatch.undo()
+
+        # 6. Tier-3 SamplingSession clears prior keepalive on __enter__ & clears on normal/error __exit__
+        assert len(mk._session_ctx_keepalive) == 1
+        with mk.sampling_session(width=16, height=16, num_steps=2, max_context_dims=(1, 64, 2560)):
+            assert len(mk._session_ctx_keepalive) == 0
+            mk(xk1, encoder_hidden_states=torch.randn(1, 4, 2560), timestep=0.9)
+            assert len(mk._session_ctx_keepalive) == 1
+        assert len(mk._session_ctx_keepalive) == 0
+
+        with pytest.raises(RuntimeError, match="tier3 abort"):
+            with mk.sampling_session(width=16, height=16, num_steps=2, max_context_dims=(1, 64, 2560)):
+                mk(xk1, encoder_hidden_states=torch.randn(1, 4, 2560), timestep=0.9)
+                assert len(mk._session_ctx_keepalive) == 1
+                raise RuntimeError("tier3 abort")
+        assert len(mk._session_ctx_keepalive) == 0
+
+        # 7. End-to-end forward() producer_stream passthrough to session_begin AND step
+        mk.end_session_if_open()
+        custom_stream = 0xCAFEBABE
+        monkeypatch.setattr(mk, "_resolve_producer_stream", lambda t: custom_stream)
+        mk(xk1, encoder_hidden_states=torch.randn(1, 4, 2560), timestep=0.9)
+        assert lib_k.sessions[-1]["producer_stream"] == custom_stream
+        assert lib_k.steps[-1]["producer_stream"] == custom_stream
+        monkeypatch.undo()
+
+        # 8. Exception zero-retention: session_begin OOM, pre-step prep OOM (qwenimage21/ltx25/minimax_h3), to("meta")
+        # (a) session_begin OOM with previously open session
+        assert len(mk._session_ctx_keepalive) == 1
+        orig_k_begin = mk._handle.session_begin
+
+        def _oom_begin(*args: Any, **kwargs: Any) -> Any:
+            raise OutOfMemoryError("oom session_begin")
+
+        mk._handle.session_begin = _oom_begin  # type: ignore[method-assign]
+        with pytest.raises(OutOfMemoryError, match="oom session_begin"):
+            mk(xk1, encoder_hidden_states=torch.randn(1, 4, 2560), timestep=0.95)
+        mk._handle.session_begin = orig_k_begin  # type: ignore[method-assign]
+        assert len(mk._session_ctx_keepalive) == 0
+        assert not mk._session_is_open()
+
+        # (b) pre-step prep OOM after _ensure_session_step: qwenimage21 ref_i prep
+        xq1 = torch.randn(1, 64, 4, 4)
+        cq1 = torch.randn(1, 8, 4096)
+        bad_ref = torch.randn(1, 64, 4, 4)
+
+        class _BoomTensor:
+            shape = bad_ref.shape
+
+            def to(self, *args: Any, **kwargs: Any) -> Any:
+                raise OutOfMemoryError("oom ref prep")
+
+        mq._session_ctx_keepalive.clear()
+        orig_validate = mq._validate_refs_and_slots
+        monkeypatch.setattr(mq, "_validate_refs_and_slots", lambda refs, slots, txt_len, batch: [0])
+        with pytest.raises(OutOfMemoryError, match="oom ref prep"):
+            mq(
+                xq1,
+                encoder_hidden_states=cq1,
+                timestep=0.9,
+                ref_latents=[_BoomTensor()],  # type: ignore[list-item]
+            )
+        monkeypatch.setattr(mq, "_validate_refs_and_slots", orig_validate)
+        assert len(mq._session_ctx_keepalive) == 0
+        assert not mq._session_is_open()
+
+        # (c) pre-step prep OOM after _ensure_session_step: ltx25 & minimax_h3 audio scratch
+        orig_l_scratch = ml._ensure_scratch
+
+        def _oom_l_aud(key: str, *args: Any, **kwargs: Any) -> torch.Tensor:
+            if key == "ltx25_aud_out":
+                raise OutOfMemoryError("oom ltx25 aud")
+            return orig_l_scratch(key, *args, **kwargs)
+
+        monkeypatch.setattr(ml, "_ensure_scratch", _oom_l_aud)
+        with pytest.raises(OutOfMemoryError, match="oom ltx25 aud"):
+            ml(
+                torch.randn(1, 128, 2, 2, 2),
+                audio_hidden_states=torch.randn(1, 8, 4, 16),
+                encoder_hidden_states=torch.randn(1, 4, 4096),
+                audio_encoder_hidden_states=torch.randn(1, 4, 2048),
+                timestep=0.9,
+            )
+        monkeypatch.undo()
+        assert len(ml._session_ctx_keepalive) == 0
+        assert not ml._session_is_open()
+
+        orig_h_scratch = mh._ensure_scratch
+
+        def _oom_h_aud(key: str, *args: Any, **kwargs: Any) -> torch.Tensor:
+            if key == "h3_aud_out":
+                raise OutOfMemoryError("oom h3 aud")
+            return orig_h_scratch(key, *args, **kwargs)
+
+        monkeypatch.setattr(mh, "_ensure_scratch", _oom_h_aud)
+        with pytest.raises(OutOfMemoryError, match="oom h3 aud"):
+            mh(
+                torch.ones(1, 24, 2, 4, 4),
+                audio_hidden_states=torch.ones(1, 32, 2, 3),
+                encoder_hidden_states=torch.randn(1, 4, 5120),
+                timestep=0.25,
+            )
+        monkeypatch.undo()
+        assert len(mh._session_ctx_keepalive) == 0
+        assert not mh._session_is_open()
+
+        # (d) to("meta") clears _session_ctx_keepalive (both cpu->meta and meta->meta)
+        mk(xk1, encoder_hidden_states=torch.randn(1, 4, 2560), timestep=0.9)
+        assert len(mk._session_ctx_keepalive) == 1
+        mk.to("meta")
+        assert len(mk._session_ctx_keepalive) == 0
+        mk._session_ctx_keepalive[999] = xk1
+        mk.to("meta")
+        assert len(mk._session_ctx_keepalive) == 0
+    finally:
+        mk.close()
+        mq.close()
+        ml.close()
+        mh.close()

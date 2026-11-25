@@ -316,6 +316,7 @@ class QuantFuncQwenImage21Transformer2DModel(QuantFuncBaseTransformer):
         if not self._session_is_open():
             self._session_opened_ratio = None
             self._split_cfg_forced_full = False
+            self._last_sigma = None
         elif self._last_sigma is not None and sigmas[0] > self._last_sigma + 1e-6:
             # New trajectory starting at a higher sigma resets split-CFG escalation.
             self._session_opened_ratio = None
@@ -327,48 +328,18 @@ class QuantFuncQwenImage21Transformer2DModel(QuantFuncBaseTransformer):
         cond_qf_dtype = _torch_dtype_to_qf(ctx_in.dtype)
 
         for i in range(batch):
-            xi = x_in[i : i + 1].contiguous()
-            oi = self._ensure_scratch("qi21_out", tuple(xi.shape), xi.dtype, dev)
-            ci = ctx_in[i : i + 1].contiguous()
-            sig_i = sigmas[i]
-            ctx_id = self._context_fingerprint(ci, i)
+            with self._step_error_cleanup():
+                xi = x_in[i : i + 1].contiguous()
+                oi = self._ensure_scratch("qi21_out", tuple(xi.shape), xi.dtype, dev)
+                ci = ctx_in[i : i + 1].contiguous()
+                sig_i = sigmas[i]
 
-            was_open_before = self._session_is_open()
-            single_cond = (batch == 1) and (not staged_do_cfg) and (not self._split_cfg_forced_full)
-            opts = self._build_base_session_options(
-                has_refs=has_refs,
-                batch=batch,
-                single_cond_group=single_cond,
-            )
-            step_idx, total_steps, ctx_key = self._ensure_session_step(
-                width=pixel_w,
-                height=pixel_h,
-                sigma=sig_i,
-                max_context_dims=self._max_context_dims_for(ci),
-                cond_dtype=cond_qf_dtype,
-                options=opts,
-                geometry_key=geom_key,
-                ctx_identity=ctx_id,
-                producer_stream=stream_ptr,
-            )
-            if not was_open_before or self._session_opened_ratio is None:
-                self._session_opened_ratio = float(opts[WIRE_QUALITY_RATIO_KEY])
-
-            # Tier-2 sequential split-CFG guard: reopen at ratio 1.0 upon encountering a second CFG branch.
-            if self._session_opened_ratio < _QUALITY_FULL_EPS and (
-                ctx_key > 1
-                or getattr(self._session_tracker, "active_branch_count", 1) > 1
-                or has_refs
-                or batch > 1
-            ):
-                self._handle.end_session_if_open()
-                if hasattr(self._session_tracker, "on_session_closed"):
-                    self._session_tracker.on_session_closed()
-                self._split_cfg_forced_full = True
-                full_opts = self._build_base_session_options(
+                was_open_before = self._session_is_open()
+                single_cond = (batch == 1) and (not staged_do_cfg) and (not self._split_cfg_forced_full)
+                opts = self._build_base_session_options(
                     has_refs=has_refs,
                     batch=batch,
-                    single_cond_group=False,
+                    single_cond_group=single_cond,
                 )
                 step_idx, total_steps, ctx_key = self._ensure_session_step(
                     width=pixel_w,
@@ -376,43 +347,74 @@ class QuantFuncQwenImage21Transformer2DModel(QuantFuncBaseTransformer):
                     sigma=sig_i,
                     max_context_dims=self._max_context_dims_for(ci),
                     cond_dtype=cond_qf_dtype,
-                    options=full_opts,
+                    options=opts,
                     geometry_key=geom_key,
-                    ctx_identity=ctx_id,
+                    ctx_identity_factory=lambda idx=i: self._context_fingerprint(encoder_hidden_states, idx),
                     producer_stream=stream_ptr,
                 )
-                self._session_opened_ratio = float(full_opts[WIRE_QUALITY_RATIO_KEY])
+                if not was_open_before or self._session_opened_ratio is None:
+                    self._session_opened_ratio = float(opts[WIRE_QUALITY_RATIO_KEY])
 
-            if has_refs:
-                ref_i = [
-                    (r[i : i + 1] if int(r.shape[0]) > 1 else r)
-                    .to(device=dev, dtype=xi.dtype)
-                    .contiguous()
-                    for r in refs
-                ]
-                self._run_step_refs(
-                    latent_in=xi,
-                    velocity_out=oi,
-                    sigma=sig_i,
-                    step_index=step_idx,
-                    total_steps=total_steps,
-                    context=ci,
-                    ref_latents=ref_i,
-                    image_slots=slots,
-                    cfg_context_key=ctx_key,
-                    producer_stream=stream_ptr,
-                )
-            else:
-                self._run_step(
-                    latent_in=xi,
-                    velocity_out=oi,
-                    sigma=sig_i,
-                    step_index=step_idx,
-                    total_steps=total_steps,
-                    context=ci,
-                    cfg_context_key=ctx_key,
-                    producer_stream=stream_ptr,
-                )
+                # Tier-2 sequential split-CFG guard: reopen at ratio 1.0 upon encountering a second CFG branch.
+                if self._session_opened_ratio < _QUALITY_FULL_EPS and (
+                    ctx_key > 1
+                    or getattr(self._session_tracker, "active_branch_count", 1) > 1
+                    or has_refs
+                    or batch > 1
+                ):
+                    self._handle.end_session_if_open()
+                    if hasattr(self._session_tracker, "on_session_closed"):
+                        self._session_tracker.on_session_closed()
+                    self._session_ctx_keepalive.clear()
+                    self._split_cfg_forced_full = True
+                    full_opts = self._build_base_session_options(
+                        has_refs=has_refs,
+                        batch=batch,
+                        single_cond_group=False,
+                    )
+                    step_idx, total_steps, ctx_key = self._ensure_session_step(
+                        width=pixel_w,
+                        height=pixel_h,
+                        sigma=sig_i,
+                        max_context_dims=self._max_context_dims_for(ci),
+                        cond_dtype=cond_qf_dtype,
+                        options=full_opts,
+                        geometry_key=geom_key,
+                        ctx_identity_factory=lambda idx=i: self._context_fingerprint(encoder_hidden_states, idx),
+                        producer_stream=stream_ptr,
+                    )
+                    self._session_opened_ratio = float(full_opts[WIRE_QUALITY_RATIO_KEY])
+
+                if has_refs:
+                    ref_i = [
+                        (r[i : i + 1] if int(r.shape[0]) > 1 else r)
+                        .to(device=dev, dtype=xi.dtype)
+                        .contiguous()
+                        for r in refs
+                    ]
+                    self._run_step_refs(
+                        latent_in=xi,
+                        velocity_out=oi,
+                        sigma=sig_i,
+                        step_index=step_idx,
+                        total_steps=total_steps,
+                        context=ci,
+                        ref_latents=ref_i,
+                        image_slots=slots,
+                        cfg_context_key=ctx_key,
+                        producer_stream=stream_ptr,
+                    )
+                else:
+                    self._run_step(
+                        latent_in=xi,
+                        velocity_out=oi,
+                        sigma=sig_i,
+                        step_index=step_idx,
+                        total_steps=total_steps,
+                        context=ci,
+                        cfg_context_key=ctx_key,
+                        producer_stream=stream_ptr,
+                    )
             out4d[i : i + 1] = oi
             self._last_sigma = sig_i
 

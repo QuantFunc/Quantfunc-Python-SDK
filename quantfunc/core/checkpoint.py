@@ -9,13 +9,29 @@ from __future__ import annotations
 import fnmatch
 import json
 import os
+import re
 import struct
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 _MAX_ST_HEADER_BYTES = 512 * 1024 * 1024
+_ST_HEADER_LEN_BYTES = struct.calcsize("<Q")
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+_JSON_WS_BYTES = frozenset((0x20, 0x09, 0x0A, 0x0D))
+_JSON_PRIM_STOP_BYTES = frozenset((0x2C, 0x7D, 0x5D, 0x20, 0x09, 0x0A, 0x0D))
+_JSON_STRUCT_TOKEN_RE = re.compile(rb'["{}\[\]]')
+_JSON_SIMPLE_ESCAPES: dict[str, str] = {
+    '"': '"',
+    "\\": "\\",
+    "/": "/",
+    "b": "\b",
+    "f": "\f",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+}
 
 
 @dataclass(frozen=True)
@@ -132,16 +148,16 @@ def name_matches_hints(path: str | os.PathLike[str], patterns: Sequence[str]) ->
     return any(fnmatch.fnmatch(base, str(p).lower()) for p in patterns)
 
 
-def sniff_safetensors_header(
+def _read_raw_safetensors_header(
     path: str | os.PathLike[str],
     *,
     max_header_bytes: int = _MAX_ST_HEADER_BYTES,
-) -> dict[str, Any]:
-    """Read only the JSON header of a ``.safetensors`` file without touching tensor bytes."""
+) -> bytes:
+    """Read and length-validate the raw JSON header bytes of a ``.safetensors`` file."""
     p = os.fspath(path)
     with open(p, "rb") as fh:
-        raw_len = fh.read(8)
-        if len(raw_len) < 8:
+        raw_len = fh.read(_ST_HEADER_LEN_BYTES)
+        if len(raw_len) < _ST_HEADER_LEN_BYTES:
             raise ValueError(f"Truncated safetensors file (missing header length): {p!r}")
         header_len = struct.unpack("<Q", raw_len)[0]
         if header_len == 0 or header_len > max_header_bytes:
@@ -149,6 +165,200 @@ def sniff_safetensors_header(
         raw_hdr = fh.read(header_len)
         if len(raw_hdr) < header_len:
             raise ValueError(f"Truncated safetensors header payload in {p!r}")
+    return raw_hdr
+
+
+def _skip_json_ws(buf: bytes, i: int, n: int) -> int:
+    while i < n and buf[i] in _JSON_WS_BYTES:
+        i += 1
+    return i
+
+
+def _scan_json_string_end(buf: bytes, start_quote: int, n: int) -> int:
+    """Locate the closing unescaped quote index for a JSON string starting at ``start_quote``."""
+    pos = start_quote + 1
+    while pos < n:
+        q = buf.find(b'"', pos)
+        if q == -1:
+            break
+        bs = q - 1
+        while bs > start_quote and buf[bs] == 0x5C:  # '\\'
+            bs -= 1
+        if ((q - 1 - bs) & 1) == 0:
+            return q
+        pos = q + 1
+    raise ValueError("Unterminated JSON string in safetensors header")
+
+
+def _parse_hex4(h: str, err_msg: str) -> int:
+    if len(h) != 4 or not all(ch in _HEX_DIGITS for ch in h):
+        raise ValueError(err_msg)
+    return int(h, 16)
+
+
+def _unescape_json_string(raw: bytes) -> str:
+    """Decode RFC-8259 JSON string escapes without invoking ``json.loads``."""
+    text = raw.decode("utf-8")
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch != "\\":
+            out.append(ch)
+            i += 1
+            continue
+        if i + 1 >= n:
+            raise ValueError("Unterminated escape sequence in safetensors header key")
+        esc = text[i + 1]
+        simple = _JSON_SIMPLE_ESCAPES.get(esc)
+        if simple is not None:
+            out.append(simple)
+            i += 2
+            continue
+        if esc == "u":
+            if i + 6 > n:
+                raise ValueError("Truncated \\u escape in safetensors header key")
+            code = _parse_hex4(
+                text[i + 2 : i + 6],
+                "Invalid \\u escape in safetensors header key",
+            )
+            i += 6
+            if 0xD800 <= code <= 0xDBFF and i + 6 <= n and text[i : i + 2] == "\\u":
+                low = _parse_hex4(
+                    text[i + 2 : i + 6],
+                    "Invalid surrogate \\u escape in safetensors header key",
+                )
+                if 0xDC00 <= low <= 0xDFFF:
+                    code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00)
+                    i += 6
+            out.append(chr(code))
+            continue
+        raise ValueError(f"Invalid escape \\{esc} in safetensors header key")
+    return "".join(out)
+
+
+def _decode_json_key(raw: bytes) -> str:
+    if b"\\" not in raw:
+        return raw.decode("utf-8")
+    return _unescape_json_string(raw)
+
+
+def _skip_json_value(buf: bytes, i: int, n: int) -> int:
+    """Skip one complete JSON value starting at ``i`` and return the next byte index."""
+    if i >= n:
+        raise ValueError("Unexpected end of safetensors header JSON value")
+    b = buf[i]
+    if b == 0x22:  # '"'
+        return _scan_json_string_end(buf, i, n) + 1
+    if b in (0x7B, 0x5B):  # '{' or '['
+        stack = [0x7D if b == 0x7B else 0x5D]
+        pos = i + 1
+        while stack:
+            m = _JSON_STRUCT_TOKEN_RE.search(buf, pos)
+            if m is None:
+                raise ValueError("Unterminated JSON container in safetensors header")
+            tok = buf[m.start()]
+            if tok == 0x22:  # '"'
+                pos = _scan_json_string_end(buf, m.start(), n) + 1
+            elif tok == 0x7B:
+                stack.append(0x7D)
+                pos = m.end()
+            elif tok == 0x5B:
+                stack.append(0x5D)
+                pos = m.end()
+            else:  # '}' or ']'
+                if tok != stack.pop():
+                    raise ValueError("Mismatched JSON container delimiter in safetensors header")
+                pos = m.end()
+        return pos
+    start = i
+    while i < n and buf[i] not in _JSON_PRIM_STOP_BYTES:
+        i += 1
+    if i == start:
+        raise ValueError("Malformed JSON primitive in safetensors header")
+    return i
+
+
+def safetensors_header_has_key_markers(
+    path: str | os.PathLike[str],
+    markers: Sequence[str],
+    *,
+    match: Literal["prefix", "substring"] = "substring",
+    max_header_bytes: int = _MAX_ST_HEADER_BYTES,
+) -> dict[str, bool]:
+    """Scan depth-1 JSON tensor keys in a ``.safetensors`` header without ``json.loads``.
+
+    Skips ``__metadata__`` and all nested value bodies (including escaped strings),
+    matching only top-level tensor key names by ``prefix`` or ``substring``.
+    """
+    if match not in ("prefix", "substring"):
+        raise ValueError(f"Unsupported match mode {match!r}; expected 'prefix' or 'substring'")
+    raw_hdr = _read_raw_safetensors_header(path, max_header_bytes=max_header_bytes)
+    results: dict[str, bool] = {str(m): False for m in markers}
+    n = len(raw_hdr)
+    p = os.fspath(path)
+
+    i = _skip_json_ws(raw_hdr, 0, n)
+    if i >= n or raw_hdr[i] != 0x7B:  # '{'
+        raise ValueError(f"Safetensors header in {p!r} is not a JSON object")
+    if not results:
+        return results
+
+    i = _skip_json_ws(raw_hdr, i + 1, n)
+    if i < n and raw_hdr[i] == 0x7D:  # '{}'
+        return results
+
+    pending = set(results.keys())
+    while i < n:
+        if raw_hdr[i] != 0x22:  # '"'
+            raise ValueError(f"Malformed safetensors header JSON key in {p!r}")
+        end_q = _scan_json_string_end(raw_hdr, i, n)
+        try:
+            key = _decode_json_key(raw_hdr[i + 1 : end_q])
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"Malformed UTF-8 in safetensors header key in {p!r}: {exc}") from exc
+
+        i = _skip_json_ws(raw_hdr, end_q + 1, n)
+        if i >= n or raw_hdr[i] != 0x3A:  # ':'
+            raise ValueError(f"Malformed safetensors header JSON (missing ':') in {p!r}")
+        i = _skip_json_ws(raw_hdr, i + 1, n)
+        i = _skip_json_value(raw_hdr, i, n)
+
+        if key != "__metadata__":
+            matched_now = [
+                m
+                for m in pending
+                if (key.startswith(m) if match == "prefix" else m in key)
+            ]
+            if matched_now:
+                for m in matched_now:
+                    results[m] = True
+                    pending.discard(m)
+                if not pending:
+                    return results
+
+        i = _skip_json_ws(raw_hdr, i, n)
+        if i >= n:
+            raise ValueError(f"Truncated safetensors header JSON in {p!r}")
+        ch = raw_hdr[i]
+        if ch == 0x2C:  # ','
+            i = _skip_json_ws(raw_hdr, i + 1, n)
+            continue
+        if ch == 0x7D:  # '}'
+            return results
+        raise ValueError(f"Malformed safetensors header JSON (expected ',' or '}}') in {p!r}")
+    raise ValueError(f"Truncated safetensors header JSON in {p!r}")
+
+
+def sniff_safetensors_header(
+    path: str | os.PathLike[str],
+    *,
+    max_header_bytes: int = _MAX_ST_HEADER_BYTES,
+) -> dict[str, Any]:
+    """Read only the JSON header of a ``.safetensors`` file without touching tensor bytes."""
+    p = os.fspath(path)
+    raw_hdr = _read_raw_safetensors_header(p, max_header_bytes=max_header_bytes)
     try:
         parsed = json.loads(raw_hdr.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as exc:
@@ -400,6 +610,7 @@ def resolve_transformer_config(
 __all__ = [
     "PresetMetadata",
     "name_matches_hints",
+    "safetensors_header_has_key_markers",
     "sniff_safetensors_header",
     "bundled_presets_root",
     "list_bundled_presets",

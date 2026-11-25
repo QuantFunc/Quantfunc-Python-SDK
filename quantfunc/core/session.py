@@ -124,6 +124,7 @@ class SamplingSession:
         guidance_scale: float = 1.0,
         do_cfg: bool = False,
         producer_stream: int = 0,
+        on_session_end: Callable[[], None] | None = None,
     ) -> None:
         self.handle = handle
         self.tracker = tracker
@@ -137,6 +138,7 @@ class SamplingSession:
         self.guidance_scale = float(guidance_scale)
         self.do_cfg = bool(do_cfg)
         self.producer_stream = int(producer_stream)
+        self.on_session_end = on_session_end
         self.session_handle: Any = None
         self._active: bool = False
 
@@ -156,26 +158,40 @@ class SamplingSession:
         return None
 
     def __enter__(self) -> SamplingSession:
-        self.handle.end_session_if_open()
-        if (
-            self.width is not None
-            and self.height is not None
-            and self.num_steps is not None
-            and self.max_context_dims is not None
-            and self.cond_dtype is not None
-        ):
-            self.session_handle = self.handle.session_begin(
-                self.width,
-                self.height,
-                self.num_steps,
-                self.max_context_dims,
-                self.cond_dtype,
-                self.options,
-                producer_stream=self.producer_stream,
-            )
-        self._active = True
-        if self.tracker is not None:
-            self.tracker.enter_explicit_session(self)
+        try:
+            self.handle.end_session_if_open()
+        finally:
+            if self.on_session_end is not None:
+                self.on_session_end()
+        try:
+            if (
+                self.width is not None
+                and self.height is not None
+                and self.num_steps is not None
+                and self.max_context_dims is not None
+                and self.cond_dtype is not None
+            ):
+                self.session_handle = self.handle.session_begin(
+                    self.width,
+                    self.height,
+                    self.num_steps,
+                    self.max_context_dims,
+                    self.cond_dtype,
+                    self.options,
+                    producer_stream=self.producer_stream,
+                )
+            self._active = True
+            if self.tracker is not None:
+                self.tracker.enter_explicit_session(self)
+        except BaseException:
+            self._active = False
+            self.session_handle = None
+            try:
+                self.handle.end_session_if_open()
+            finally:
+                if self.on_session_end is not None:
+                    self.on_session_end()
+            raise
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -185,7 +201,11 @@ class SamplingSession:
         finally:
             self._active = False
             self.session_handle = None
-            self.handle.end_session_if_open()
+            try:
+                self.handle.end_session_if_open()
+            finally:
+                if self.on_session_end is not None:
+                    self.on_session_end()
 
 
 class AutoSessionTracker:
@@ -197,12 +217,14 @@ class AutoSessionTracker:
         *,
         default_steps: int = DEFAULT_AUTO_SESSION_MAX_STEPS,
         busy_retry_delay_s: float = _DEFAULT_BUSY_RETRY_DELAY_S,
+        on_session_reset: Callable[[], None] | None = None,
     ) -> None:
         if isinstance(default_steps, bool) or not isinstance(default_steps, int) or default_steps <= 0:
             raise ValueError(f"default_steps must be a positive integer, got {default_steps!r}")
         self._handle = handle
         self._default_steps: int = int(default_steps)
         self._busy_retry_delay_s: float = float(max(0.0, busy_retry_delay_s))
+        self._on_session_reset = on_session_reset
 
         self._staged_schedule: StagedSchedule | None = None
         self._explicit_session: SamplingSession | None = None
@@ -287,6 +309,8 @@ class AutoSessionTracker:
         self._step_index = -1
         self._same_sigma_branch_count = 0
         self._ctx_assigner.reset()
+        if self._on_session_reset is not None:
+            self._on_session_reset()
 
     def on_session_closed(self) -> None:
         """Reset cached tracking state after an external session close."""
@@ -358,6 +382,7 @@ class AutoSessionTracker:
         *,
         cfg_group_idx: int | None = None,
         sig_id: Any = None,
+        sig_id_factory: Callable[[], Any] | None = None,
         allow_busy_retry: bool = True,
     ) -> tuple[int, int, int]:
         """Ensure an active native session and return ``(step_index, total_steps, cfg_context_key)``."""
@@ -459,8 +484,9 @@ class AutoSessionTracker:
 
         self._last_sigma = cur_sigma
 
-        if sig_id is not None:
-            ctx_key = self._ctx_assigner.key(sig_id)
+        eff_sig_id = sig_id_factory() if sig_id_factory is not None else sig_id
+        if eff_sig_id is not None:
+            ctx_key = self._ctx_assigner.key(eff_sig_id)
         elif cfg_group_idx is not None:
             ctx_key = self._ctx_assigner.key(("cfg_group", int(cfg_group_idx)))
         else:
@@ -479,6 +505,7 @@ class AutoSessionTracker:
         options: Mapping[str, Any],
         geometry_key: Any,
         ctx_identity: Any = None,
+        ctx_identity_factory: Callable[[], Any] | None = None,
         producer_stream: int = 0,
         allow_busy_retry: bool = True,
         before_begin: Callable[[], None] | None = None,
@@ -510,6 +537,7 @@ class AutoSessionTracker:
             options=options,
             open_fn=_open,
             sig_id=ctx_identity,
+            sig_id_factory=ctx_identity_factory,
             allow_busy_retry=allow_busy_retry,
         )
 

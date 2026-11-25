@@ -118,7 +118,7 @@ def _compress_middle_padded_context(
             f"must match (batch={batch}, seq_len={seq_len})"
         )
 
-    counts = [int(mask[b].sum().item()) for b in range(batch)]
+    counts = [int(c) for c in mask.sum(dim=1).cpu().tolist()]
     if any(c == 0 for c in counts):
         raise ValueError("Krea-2 encoder_attention_mask has zero valid tokens (all-zero mask)")
     if batch > 1 and len(set(counts)) > 1:
@@ -321,37 +321,39 @@ class QuantFuncKrea2Transformer2DModel(QuantFuncBaseTransformer):
         cond_qf_dtype = _torch_dtype_to_qf(ctx_in.dtype)
 
         for i in range(batch):
-            xi = x_in[i : i + 1].contiguous()
-            oi = self._ensure_scratch("krea2_out", tuple(xi.shape), xi.dtype, dev)
-            ci = ctx_in[i : i + 1].contiguous()
-            sig_i = sigmas[i]
-            ctx_id = self._context_fingerprint(ci, i)
-            opts = self._build_base_session_options(
-                has_refs=False,
-                batch=batch,
-                single_cond_group=(batch == 1),
-            )
-            step_idx, total_steps, ctx_key = self._ensure_session_step(
-                width=pixel_w,
-                height=pixel_h,
-                sigma=sig_i,
-                max_context_dims=self._max_context_dims_for(ci),
-                cond_dtype=cond_qf_dtype,
-                options=opts,
-                geometry_key=geom_key,
-                ctx_identity=ctx_id,
-                producer_stream=stream_ptr,
-            )
-            self._run_step(
-                latent_in=xi,
-                velocity_out=oi,
-                sigma=sig_i,
-                step_index=step_idx,
-                total_steps=total_steps,
-                context=ci,
-                cfg_context_key=ctx_key,
-                producer_stream=stream_ptr,
-            )
+            with self._step_error_cleanup():
+                xi = x_in[i : i + 1].contiguous()
+                oi = self._ensure_scratch("krea2_out", tuple(xi.shape), xi.dtype, dev)
+                ci = ctx_in[i : i + 1].contiguous()
+                sig_i = sigmas[i]
+                opts = self._build_base_session_options(
+                    has_refs=False,
+                    batch=batch,
+                    single_cond_group=(batch == 1),
+                )
+                step_idx, total_steps, ctx_key = self._ensure_session_step(
+                    width=pixel_w,
+                    height=pixel_h,
+                    sigma=sig_i,
+                    max_context_dims=self._max_context_dims_for(ci),
+                    cond_dtype=cond_qf_dtype,
+                    options=opts,
+                    geometry_key=geom_key,
+                    ctx_identity_factory=lambda idx=i: self._context_fingerprint(
+                        (encoder_hidden_states, encoder_attention_mask), idx
+                    ),
+                    producer_stream=stream_ptr,
+                )
+                self._run_step(
+                    latent_in=xi,
+                    velocity_out=oi,
+                    sigma=sig_i,
+                    step_index=step_idx,
+                    total_steps=total_steps,
+                    context=ci,
+                    cfg_context_key=ctx_key,
+                    producer_stream=stream_ptr,
+                )
             out4d[i : i + 1] = oi
 
         if was_3d:

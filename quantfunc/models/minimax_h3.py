@@ -839,71 +839,71 @@ class QuantFuncMiniMaxH3Transformer3DModel(QuantFuncBaseTransformer):
         cond_qf_dtype = _torch_dtype_to_qf(ctx_in.dtype)
 
         for i in range(batch):
-            vi = vid_in[i : i + 1].contiguous()
-            vo = self._ensure_scratch("h3_vid_out", tuple(vi.shape), vi.dtype, dev)
-            ci = ctx_in[i : i + 1].contiguous()
-            sig_i = engine_sigmas[i]
-            ctx_id = self._context_fingerprint(ci, i)
+            with self._step_error_cleanup():
+                vi = vid_in[i : i + 1].contiguous()
+                vo = self._ensure_scratch("h3_vid_out", tuple(vi.shape), vi.dtype, dev)
+                ci = ctx_in[i : i + 1].contiguous()
+                sig_i = engine_sigmas[i]
 
-            opts = self._build_base_session_options(
-                has_refs=False,
-                batch=batch,
-                single_cond_group=(batch == 1),
-            )
-            opts["num_frames"] = int(eff_frames)
-            opts["fps"] = float(eff_fps)
-            opts["av_sigma_shift_video"] = float(shift_v)
-            opts["av_sigma_shift_audio"] = float(shift_a)
-            if aud_gen is not None:
-                opts["audio_dims"] = [1, int(aud_ch), int(stereo), int(audio_t)]
+                opts = self._build_base_session_options(
+                    has_refs=False,
+                    batch=batch,
+                    single_cond_group=(batch == 1),
+                )
+                opts["num_frames"] = int(eff_frames)
+                opts["fps"] = float(eff_fps)
+                opts["av_sigma_shift_video"] = float(shift_v)
+                opts["av_sigma_shift_audio"] = float(shift_a)
+                if aud_gen is not None:
+                    opts["audio_dims"] = [1, int(aud_ch), int(stereo), int(audio_t)]
 
-            cond_list, vision_ranges = self._serialize_av_conditions(dev)
-            if cond_list:
-                opts["av_conds"] = cond_list
-            if vision_ranges:
-                opts["text_vision_row_ranges"] = vision_ranges
+                cond_list, vision_ranges = self._serialize_av_conditions(dev)
+                if cond_list:
+                    opts["av_conds"] = cond_list
+                if vision_ranges:
+                    opts["text_vision_row_ranges"] = vision_ranges
 
-            step_idx, total_steps, ctx_key = self._ensure_session_step(
-                width=pixel_w,
-                height=pixel_h,
-                sigma=sig_i,
-                max_context_dims=self._max_context_dims_for(ci),
-                cond_dtype=cond_qf_dtype,
-                options=opts,
-                geometry_key=geom_key,
-                ctx_identity=ctx_id,
-                producer_stream=stream_ptr,
-            )
-
-            if aud_gen is not None and out_aud_gen is not None:
-                ai = aud_gen[i : i + 1].to(device=dev, dtype=torch.float32).contiguous()
-                ao = self._ensure_scratch("h3_aud_out", tuple(ai.shape), torch.float32, dev)
-                self._run_step_av(
-                    latent_in=vi,
-                    velocity_out=vo,
-                    audio_latent_in=ai,
-                    audio_velocity_out=ao,
+                step_idx, total_steps, ctx_key = self._ensure_session_step(
+                    width=pixel_w,
+                    height=pixel_h,
                     sigma=sig_i,
-                    step_index=step_idx,
-                    total_steps=total_steps,
-                    context=ci,
-                    cfg_context_key=ctx_key,
-                    audio_scale=eff_audio_scale,
-                    audio_reference_active=0,
+                    max_context_dims=self._max_context_dims_for(ci),
+                    cond_dtype=cond_qf_dtype,
+                    options=opts,
+                    geometry_key=geom_key,
+                    ctx_identity_factory=lambda idx=i: self._context_fingerprint(encoder_hidden_states, idx),
                     producer_stream=stream_ptr,
                 )
-                out_aud_gen[i : i + 1] = ao
-            else:
-                self._run_step(
-                    latent_in=vi,
-                    velocity_out=vo,
-                    sigma=sig_i,
-                    step_index=step_idx,
-                    total_steps=total_steps,
-                    context=ci,
-                    cfg_context_key=ctx_key,
-                    producer_stream=stream_ptr,
-                )
+
+                if aud_gen is not None and out_aud_gen is not None:
+                    ai = aud_gen[i : i + 1].to(device=dev, dtype=torch.float32).contiguous()
+                    ao = self._ensure_scratch("h3_aud_out", tuple(ai.shape), torch.float32, dev)
+                    self._run_step_av(
+                        latent_in=vi,
+                        velocity_out=vo,
+                        audio_latent_in=ai,
+                        audio_velocity_out=ao,
+                        sigma=sig_i,
+                        step_index=step_idx,
+                        total_steps=total_steps,
+                        context=ci,
+                        cfg_context_key=ctx_key,
+                        audio_scale=eff_audio_scale,
+                        audio_reference_active=0,
+                        producer_stream=stream_ptr,
+                    )
+                    out_aud_gen[i : i + 1] = ao
+                else:
+                    self._run_step(
+                        latent_in=vi,
+                        velocity_out=vo,
+                        sigma=sig_i,
+                        step_index=step_idx,
+                        total_steps=total_steps,
+                        context=ci,
+                        cfg_context_key=ctx_key,
+                        producer_stream=stream_ptr,
+                    )
             out_vid_gen[i : i + 1] = vo
 
         if eff_data_dir:

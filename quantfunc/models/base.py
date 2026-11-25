@@ -7,7 +7,7 @@ import logging
 import math
 import os
 from collections import OrderedDict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -55,6 +55,9 @@ from quantfunc.native.handle import QFEngineHandle, estimate_vram, make_create_p
 from quantfunc.native.loader import load_lib
 
 logger = logging.getLogger(__name__)
+
+_CUDA_STREAM_LEGACY: int = 1  # cudaStreamLegacy sentinel (0x1) for GPU-side default-stream sync
+_MAX_SESSION_CTX_KEEPALIVE: int = 16
 
 _TORCH_TO_QF_DTYPE: dict[torch.dtype, int] = {
     torch.float32: QF_DTYPE_FP32,
@@ -270,9 +273,11 @@ class QuantFuncBaseTransformer(_BaseModelMixin, _BaseConfigMixin, _BaseCacheMixi
         )
 
         self._default_steps: int = int(DEFAULT_AUTO_SESSION_MAX_STEPS)
+        self._session_ctx_keepalive: dict[int, torch.Tensor] = {}
         self._session_tracker: AutoSessionTracker = AutoSessionTracker(
             self._handle,
             default_steps=self._default_steps,
+            on_session_reset=self._session_ctx_keepalive.clear,
         )
         self._staged_schedule: StagedSchedule | None = None
         self._sol_sigmas: list[float] | None = None
@@ -287,7 +292,7 @@ class QuantFuncBaseTransformer(_BaseModelMixin, _BaseConfigMixin, _BaseCacheMixi
             getattr(self._engine_config, "attention_backend", "auto")
         )
         self._producer_stream_mode: str = str(
-            getattr(self._engine_config, "producer_stream_mode", "sync")
+            getattr(self._engine_config, "producer_stream_mode", "torch_current")
         )
         self._active_cache_context: str | None = None
         self._scratch: dict[str, torch.Tensor] = {}
@@ -340,7 +345,7 @@ class QuantFuncBaseTransformer(_BaseModelMixin, _BaseConfigMixin, _BaseCacheMixi
         vram_budget_mb: int = 0,
         act_scale_g32: bool | None = None,
         glu_fuse: bool | None = None,
-        producer_stream_mode: str = "sync",
+        producer_stream_mode: str = "torch_current",
         api_key: str | None = None,
         server_url: str | None = None,
         cache_dir: str | os.PathLike[str] | None = None,
@@ -579,6 +584,8 @@ class QuantFuncBaseTransformer(_BaseModelMixin, _BaseConfigMixin, _BaseCacheMixi
             new_dev_id = int(target_dev.index) if target_dev.index is not None else 0
             if new_dev_id != self._device_id:
                 self._recreate_handle_on_device(new_dev_id)
+        elif target_dev is not None and target_dev.type == "meta":
+            self._session_ctx_keepalive.clear()
 
         anchor = self._qf_device_anchor
         eff_dtype = target_dtype if target_dtype is not None else anchor.dtype
@@ -671,6 +678,7 @@ class QuantFuncBaseTransformer(_BaseModelMixin, _BaseConfigMixin, _BaseCacheMixi
         self._session_tracker = AutoSessionTracker(
             new_handle,
             default_steps=self._default_steps,
+            on_session_reset=self._session_ctx_keepalive.clear,
         )
         if self._staged_schedule is not None:
             self._session_tracker.set_schedule(self._staged_schedule)
@@ -989,6 +997,7 @@ class QuantFuncBaseTransformer(_BaseModelMixin, _BaseConfigMixin, _BaseCacheMixi
             options=merged_opts,
             sigmas=sigmas,
             do_cfg=do_cfg,
+            on_session_end=self._session_ctx_keepalive.clear,
         )
 
     def end_session_if_open(self) -> tuple[bool, bool]:
@@ -1014,6 +1023,7 @@ class QuantFuncBaseTransformer(_BaseModelMixin, _BaseConfigMixin, _BaseCacheMixi
 
     def _end_session_if_open(self) -> tuple[bool, bool]:
         self._release_scratch()
+        self._session_ctx_keepalive.clear()
         self._reset_timestep_scale_tracking()
         if self._session_tracker is not None and hasattr(self._session_tracker, "end_session_if_open"):
             return self._session_tracker.end_session_if_open()
@@ -1082,11 +1092,16 @@ class QuantFuncBaseTransformer(_BaseModelMixin, _BaseConfigMixin, _BaseCacheMixi
 
     def _release_scratch(self) -> None:
         self._scratch.clear()
+        self._session_ctx_keepalive.clear()
+
+    def _resolve_producer_stream(self, tensor: torch.Tensor) -> int:
+        if self._producer_stream_mode == "torch_current" and tensor.is_cuda:
+            raw = int(torch.cuda.current_stream(tensor.device).cuda_stream)
+            return raw if raw != 0 else _CUDA_STREAM_LEGACY
+        return 0
 
     def _producer_stream_ptr(self, tensor: torch.Tensor) -> int:
-        if self._producer_stream_mode == "torch_current" and tensor.is_cuda:
-            return int(torch.cuda.current_stream(tensor.device).cuda_stream)
-        return 0
+        return self._resolve_producer_stream(tensor)
 
     def _spatial_scale(self) -> int:
         if self._preset is not None:
@@ -1158,25 +1173,91 @@ class QuantFuncBaseTransformer(_BaseModelMixin, _BaseConfigMixin, _BaseCacheMixi
             flat = timestep.detach().float().reshape(-1)
             if flat.numel() == 0:
                 raise ValueError("timestep tensor must be non-empty")
-            if flat.numel() == 1:
-                v = self._normalize_scalar_sigma(float(flat[0].item()))
+            vals = flat.cpu().tolist()
+            if len(vals) == 1:
+                v = self._normalize_scalar_sigma(float(vals[0]))
                 return [v] * batch
-            if flat.numel() >= batch:
-                return [self._normalize_scalar_sigma(float(flat[i].item())) for i in range(batch)]
-            raise ValueError(f"timestep length {flat.numel()} does not match batch size {batch}")
+            if len(vals) >= batch:
+                return [self._normalize_scalar_sigma(float(vals[i])) for i in range(batch)]
+            raise ValueError(f"timestep length {len(vals)} does not match batch size {batch}")
         v = self._normalize_scalar_sigma(float(timestep))
         return [v] * batch
 
-    def _context_fingerprint(self, ctx_item: torch.Tensor, batch_idx: int) -> Any:
-        """Build a stable conditioning-group identity token for CtxKeyAssigner."""
+    def _context_fingerprint(
+        self,
+        ctx_item: torch.Tensor | Sequence[torch.Tensor | None],
+        batch_idx: int,
+    ) -> Any:
+        """Build a stable conditioning-group identity token for CtxKeyAssigner with 0-sync fast path.
+
+        Contract:
+        - When ``cache_context(name)`` is active, returns ``(name, batch_idx)``.
+        - Normal path (up to 16 distinct caller tensor ``data_ptr()`` values per session):
+          retains references in ``_session_ctx_keepalive`` (cleared on session end / scratch release)
+          to prevent allocator address reuse (ABA) and fingerprints via
+          ``(data_ptr, _version, shape, stride, dtype, device)`` with zero GPU->CPU ``.item()`` syncs.
+          Standard PyTorch in-place ops (``mul_``, ``copy_``, ``zero_``, etc.) automatically bump
+          ``_version`` and rotate the key; mutations bypassing ``_version`` (such as
+          ``tensor.data.copy_()``) must use an explicit ``cache_context(...)``.
+          Inference tensors created under ``torch.inference_mode()`` have no ``_version`` counter
+          (accessing ``t._version`` raises ``RuntimeError``) and map to ``-1`` via
+          ``t.is_inference()`` (0-sync C++ ``TensorImpl`` flag check). They cannot be mutated
+          in-place outside ``inference_mode``; any in-place mutation inside ``inference_mode``
+          bypasses ``_version`` and must use an explicit ``cache_context(...)`` (consistent with
+          the ``tensor.data.copy_()`` contract).
+        - Overflow fallback (>16 distinct ``data_ptr()`` in a single session): never evicts existing
+          keepalive entries (preventing ABA collisions) and falls back for the overflow call to a
+          lightweight 3-scalar content fingerprint ``(flat[0], flat[mid], flat[-1])``.
+        """
         if self._active_cache_context is not None:
             return (self._active_cache_context, batch_idx)
-        ptr = int(ctx_item.data_ptr())
-        flat = ctx_item.detach().reshape(-1)
-        head = float(flat[0].item()) if flat.numel() > 0 else 0.0
-        tail = float(flat[-1].item()) if flat.numel() > 0 else 0.0
-        total = float(flat.float().sum().item()) if flat.numel() > 0 else 0.0
-        return (ptr, tuple(ctx_item.shape), head, tail, round(total, 5), batch_idx)
+
+        raw_tensors: tuple[torch.Tensor, ...]
+        if torch.is_tensor(ctx_item):
+            raw_tensors = (ctx_item,)
+        else:
+            raw_tensors = tuple(t for t in ctx_item if t is not None)
+
+        new_ptrs: dict[int, torch.Tensor] = {}
+        for t in raw_tensors:
+            ptr = int(t.data_ptr())
+            if ptr not in self._session_ctx_keepalive and ptr not in new_ptrs:
+                new_ptrs[ptr] = t
+
+        if len(self._session_ctx_keepalive) + len(new_ptrs) <= _MAX_SESSION_CTX_KEEPALIVE:
+            if new_ptrs:
+                self._session_ctx_keepalive.update(new_ptrs)
+            return (
+                "ptr",
+                tuple(
+                    (
+                        int(t.data_ptr()),
+                        -1 if t.is_inference() else int(getattr(t, "_version", 0)),
+                        tuple(t.shape),
+                        tuple(t.stride()),
+                        t.dtype,
+                        t.device,
+                    )
+                    for t in raw_tensors
+                ),
+                batch_idx,
+            )
+
+        val_sig: list[tuple[Any, ...]] = []
+        for t in raw_tensors:
+            flat = t.detach().reshape(-1)
+            n = flat.numel()
+            if n == 0:
+                sample = (0.0, 0.0, 0.0)
+            else:
+                mid = n // 2
+                sample = (
+                    float(flat[0].item()),
+                    float(flat[mid].item()),
+                    float(flat[-1].item()),
+                )
+            val_sig.append((tuple(t.shape), t.dtype, sample))
+        return ("val", tuple(val_sig), batch_idx)
 
     def _max_context_dims_for(self, ctx_item: torch.Tensor) -> tuple[int, int, int]:
         seq = max(int(ctx_item.shape[1]), int(DEFAULT_MAX_CONTEXT_SEQ))
@@ -1184,6 +1265,26 @@ class QuantFuncBaseTransformer(_BaseModelMixin, _BaseConfigMixin, _BaseCacheMixi
 
     def _session_is_open(self) -> bool:
         return getattr(self._handle, "current_session", None) is not None
+
+    def _abort_session_on_error(self) -> None:
+        try:
+            if self._handle is not None:
+                self._handle.end_session_if_open()
+        finally:
+            try:
+                if hasattr(self._session_tracker, "on_session_closed"):
+                    self._session_tracker.on_session_closed()
+            finally:
+                self._session_ctx_keepalive.clear()
+                self._reset_timestep_scale_tracking()
+
+    @contextmanager
+    def _step_error_cleanup(self) -> Iterator[None]:
+        try:
+            yield
+        except BaseException:
+            self._abort_session_on_error()
+            raise
 
     def _ensure_session_step(
         self,
@@ -1195,7 +1296,8 @@ class QuantFuncBaseTransformer(_BaseModelMixin, _BaseConfigMixin, _BaseCacheMixi
         cond_dtype: int,
         options: dict[str, Any],
         geometry_key: Any,
-        ctx_identity: Any,
+        ctx_identity: Any = None,
+        ctx_identity_factory: Callable[[], Any] | None = None,
         producer_stream: int = 0,
         allow_busy_retry: bool = True,
         before_begin: Callable[[], None] | None = None,
@@ -1210,30 +1312,26 @@ class QuantFuncBaseTransformer(_BaseModelMixin, _BaseConfigMixin, _BaseCacheMixi
             if after_begin is not None:
                 after_begin()
 
-        return self._session_tracker.prepare_step(
-            width=int(width),
-            height=int(height),
-            sigma=float(sigma),
-            max_context_dims=max_context_dims,
-            cond_dtype=int(cond_dtype),
-            options=options,
-            geometry_key=geometry_key,
-            ctx_identity=ctx_identity,
-            producer_stream=int(producer_stream),
-            allow_busy_retry=allow_busy_retry,
-            before_begin=before_begin,
-            after_begin=_wrapped_after_begin,
-        )
+        with self._step_error_cleanup():
+            return self._session_tracker.prepare_step(
+                width=int(width),
+                height=int(height),
+                sigma=float(sigma),
+                max_context_dims=max_context_dims,
+                cond_dtype=int(cond_dtype),
+                options=options,
+                geometry_key=geometry_key,
+                ctx_identity=ctx_identity,
+                ctx_identity_factory=ctx_identity_factory,
+                producer_stream=int(producer_stream),
+                allow_busy_retry=allow_busy_retry,
+                before_begin=before_begin,
+                after_begin=_wrapped_after_begin,
+            )
 
     def _call_step_guarded(self, step_fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-        try:
+        with self._step_error_cleanup():
             return step_fn(*args, **kwargs)
-        except BaseException:
-            self._handle.end_session_if_open()
-            if hasattr(self._session_tracker, "on_session_closed"):
-                self._session_tracker.on_session_closed()
-            self._reset_timestep_scale_tracking()
-            raise
 
     @staticmethod
     def _build_step_params(
@@ -1279,17 +1377,18 @@ class QuantFuncBaseTransformer(_BaseModelMixin, _BaseConfigMixin, _BaseCacheMixi
         cfg_context_key: int,
         producer_stream: int = 0,
     ) -> None:
-        params = self._build_step_params(
-            latent_in=latent_in,
-            velocity_out=velocity_out,
-            sigma=sigma,
-            step_index=step_index,
-            total_steps=total_steps,
-            context=context,
-            cfg_context_key=cfg_context_key,
-            producer_stream=producer_stream,
-        )
-        self._call_step_guarded(self._handle.step, params)
+        with self._step_error_cleanup():
+            params = self._build_step_params(
+                latent_in=latent_in,
+                velocity_out=velocity_out,
+                sigma=sigma,
+                step_index=step_index,
+                total_steps=total_steps,
+                context=context,
+                cfg_context_key=cfg_context_key,
+                producer_stream=producer_stream,
+            )
+            self._call_step_guarded(self._handle.step, params)
 
     def _run_step_av(
         self,
@@ -1307,31 +1406,32 @@ class QuantFuncBaseTransformer(_BaseModelMixin, _BaseConfigMixin, _BaseCacheMixi
         audio_reference_active: int = 0,
         producer_stream: int = 0,
     ) -> None:
-        base = self._build_step_params(
-            latent_in=latent_in,
-            velocity_out=velocity_out,
-            sigma=sigma,
-            step_index=step_index,
-            total_steps=total_steps,
-            context=context,
-            cfg_context_key=cfg_context_key,
-            producer_stream=producer_stream,
-        )
-        av = QFStepAvParams()
-        ctypes.memset(ctypes.byref(av), 0, ctypes.sizeof(av))
-        av.struct_size = ctypes.sizeof(QFStepAvParams)
-        av.base = base
-        av.audio_latent_in = int(audio_latent_in.data_ptr())
-        av.audio_velocity_out = int(audio_velocity_out.data_ptr())
-        av.audio_velocity_out_capacity = int(
-            audio_velocity_out.numel() * audio_velocity_out.element_size()
-        )
-        for idx, dim in enumerate(audio_latent_in.shape):
-            av.audio_dims[idx] = int(dim)
-        av.audio_dtype = _torch_dtype_to_qf(audio_latent_in.dtype)
-        av.audio_scale = float(audio_scale)
-        av.audio_reference_active = int(audio_reference_active)
-        self._call_step_guarded(self._handle.step_av, av)
+        with self._step_error_cleanup():
+            base = self._build_step_params(
+                latent_in=latent_in,
+                velocity_out=velocity_out,
+                sigma=sigma,
+                step_index=step_index,
+                total_steps=total_steps,
+                context=context,
+                cfg_context_key=cfg_context_key,
+                producer_stream=producer_stream,
+            )
+            av = QFStepAvParams()
+            ctypes.memset(ctypes.byref(av), 0, ctypes.sizeof(av))
+            av.struct_size = ctypes.sizeof(QFStepAvParams)
+            av.base = base
+            av.audio_latent_in = int(audio_latent_in.data_ptr())
+            av.audio_velocity_out = int(audio_velocity_out.data_ptr())
+            av.audio_velocity_out_capacity = int(
+                audio_velocity_out.numel() * audio_velocity_out.element_size()
+            )
+            for idx, dim in enumerate(audio_latent_in.shape):
+                av.audio_dims[idx] = int(dim)
+            av.audio_dtype = _torch_dtype_to_qf(audio_latent_in.dtype)
+            av.audio_scale = float(audio_scale)
+            av.audio_reference_active = int(audio_reference_active)
+            self._call_step_guarded(self._handle.step_av, av)
 
     def _run_step_refs(
         self,
@@ -1347,30 +1447,31 @@ class QuantFuncBaseTransformer(_BaseModelMixin, _BaseConfigMixin, _BaseCacheMixi
         cfg_context_key: int,
         producer_stream: int = 0,
     ) -> None:
-        base = self._build_step_params(
-            latent_in=latent_in,
-            velocity_out=velocity_out,
-            sigma=sigma,
-            step_index=step_index,
-            total_steps=total_steps,
-            context=context,
-            cfg_context_key=cfg_context_key,
-            producer_stream=producer_stream,
-        )
-        n_refs = len(ref_latents)
-        ptrs = (ctypes.c_void_p * n_refs)(*(int(t.data_ptr()) for t in ref_latents))
-        flat_dims = [int(d) for t in ref_latents for d in t.shape]
-        dims_arr = (ctypes.c_int32 * len(flat_dims))(*flat_dims)
-        slots_arr = (ctypes.c_int32 * n_refs)(*(int(s) for s in image_slots))
+        with self._step_error_cleanup():
+            base = self._build_step_params(
+                latent_in=latent_in,
+                velocity_out=velocity_out,
+                sigma=sigma,
+                step_index=step_index,
+                total_steps=total_steps,
+                context=context,
+                cfg_context_key=cfg_context_key,
+                producer_stream=producer_stream,
+            )
+            n_refs = len(ref_latents)
+            ptrs = (ctypes.c_void_p * n_refs)(*(int(t.data_ptr()) for t in ref_latents))
+            flat_dims = [int(d) for t in ref_latents for d in t.shape]
+            dims_arr = (ctypes.c_int32 * len(flat_dims))(*flat_dims)
+            slots_arr = (ctypes.c_int32 * n_refs)(*(int(s) for s in image_slots))
 
-        rp = QFStepRefsParams()
-        ctypes.memset(ctypes.byref(rp), 0, ctypes.sizeof(rp))
-        rp.struct_size = ctypes.sizeof(QFStepRefsParams)
-        rp.base = base
-        rp.num_refs = int(n_refs)
-        rp.ref_latents = ctypes.cast(ptrs, ctypes.POINTER(ctypes.c_void_p))
-        rp.ref_dims = ctypes.cast(dims_arr, ctypes.POINTER(ctypes.c_int32))
-        rp.image_slots = ctypes.cast(slots_arr, ctypes.POINTER(ctypes.c_int32))
-        # Keep backing ctypes buffers alive for the duration of the native call.
-        rp._keep = (ptrs, dims_arr, slots_arr, ref_latents)
-        self._call_step_guarded(self._handle.step_refs, rp)
+            rp = QFStepRefsParams()
+            ctypes.memset(ctypes.byref(rp), 0, ctypes.sizeof(rp))
+            rp.struct_size = ctypes.sizeof(QFStepRefsParams)
+            rp.base = base
+            rp.num_refs = int(n_refs)
+            rp.ref_latents = ctypes.cast(ptrs, ctypes.POINTER(ctypes.c_void_p))
+            rp.ref_dims = ctypes.cast(dims_arr, ctypes.POINTER(ctypes.c_int32))
+            rp.image_slots = ctypes.cast(slots_arr, ctypes.POINTER(ctypes.c_int32))
+            # Keep backing ctypes buffers alive for the duration of the native call.
+            rp._keep = (ptrs, dims_arr, slots_arr, ref_latents)
+            self._call_step_guarded(self._handle.step_refs, rp)

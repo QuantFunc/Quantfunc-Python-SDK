@@ -1309,3 +1309,431 @@ def test_mutation_m7_overrides_and_lora_security(
         with pytest.raises(ValueError):
             overrides.RuntimeOverrides.from_dict({"unknown_dial": 1})
     monkeypatch.undo()
+
+
+# ── Test 41 (U-C03): producer_stream_mode default "torch_current" & cudaStreamLegacy (0x1) ──
+
+
+def test_producer_stream_mode_default_and_legacy_sentinel(
+    tmp_path: Path,
+    fake_qf_lib: FakeQFLib,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import torch
+
+    from quantfunc.models import QuantFuncKrea2Transformer2DModel
+    from quantfunc.native.handle import CREATE_CONFIG_ALLOWLIST
+
+    # 1. EngineConfig default is "torch_current" and to_create_dict() stays strictly within 12-key allowlist
+    ec_default = config.EngineConfig()
+    assert ec_default.producer_stream_mode == "torch_current"
+    cd_default = ec_default.to_create_dict()
+    assert set(cd_default.keys()).issubset(CREATE_CONFIG_ALLOWLIST)
+    assert "producer_stream_mode" not in cd_default
+    assert len(CREATE_CONFIG_ALLOWLIST) == 12
+
+    # 2. Explicit "sync" contract preserved; invalid producer_stream_mode rejected
+    ec_sync = config.EngineConfig(producer_stream_mode="sync")
+    assert ec_sync.producer_stream_mode == "sync"
+    for bad_mode in ("", "cuda", "legacy", "ASYNC", None, 123, True):
+        with pytest.raises(ValueError, match="producer_stream_mode"):
+            config.EngineConfig(producer_stream_mode=bad_mode)  # type: ignore[arg-type]
+
+    # 3. _resolve_producer_stream / _producer_stream_ptr across default stream (0->1), custom stream, CPU, and "sync"
+    ckpt = _write_synthetic_safetensors(
+        tmp_path / "krea2-stream-test.safetensors",
+        {"transformer_blocks.0.attn.to_q.weight": ("F32", [1, 2], struct.pack("<2f", 1.0, 2.0))},
+    )
+    m_default = QuantFuncKrea2Transformer2DModel.from_pretrained(ckpt, lib=fake_qf_lib, torch_dtype=torch.float32)
+    m_sync = QuantFuncKrea2Transformer2DModel.from_pretrained(
+        ckpt, lib=fake_qf_lib, torch_dtype=torch.float32, producer_stream_mode="sync"
+    )
+    try:
+        assert m_default._producer_stream_mode == "torch_current"
+        assert m_sync._producer_stream_mode == "sync"
+
+        # CPU tensor always resolves to 0
+        cpu_t = torch.zeros(1, 2, dtype=torch.float32)
+        assert m_default._resolve_producer_stream(cpu_t) == 0
+        assert m_default._producer_stream_ptr(cpu_t) == 0
+        assert m_sync._resolve_producer_stream(cpu_t) == 0
+
+        class _FakeCudaTensor:
+            is_cuda = True
+            device = torch.device("cpu")
+
+        class _FakeStream:
+            def __init__(self, ptr: int) -> None:
+                self.cuda_stream = ptr
+
+        fake_cuda = _FakeCudaTensor()
+
+        # Default PyTorch CUDA stream (raw == 0) -> cudaStreamLegacy sentinel 1 (0x1)
+        monkeypatch.setattr(torch.cuda, "current_stream", lambda dev=None: _FakeStream(0))
+        assert m_default._resolve_producer_stream(fake_cuda) == 1  # type: ignore[arg-type]
+        assert m_default._producer_stream_ptr(fake_cuda) == 1  # type: ignore[arg-type]
+        # Explicit "sync" mode still returns 0 even for CUDA tensor
+        assert m_sync._resolve_producer_stream(fake_cuda) == 0  # type: ignore[arg-type]
+
+        # Non-zero custom CUDA stream passes through verbatim
+        custom_ptr = 0x7F12345600
+        monkeypatch.setattr(torch.cuda, "current_stream", lambda dev=None: _FakeStream(custom_ptr))
+        assert m_default._resolve_producer_stream(fake_cuda) == custom_ptr  # type: ignore[arg-type]
+        assert m_default._producer_stream_ptr(fake_cuda) == custom_ptr  # type: ignore[arg-type]
+        assert m_sync._resolve_producer_stream(fake_cuda) == 0  # type: ignore[arg-type]
+    finally:
+        m_default.close()
+        m_sync.close()
+
+
+# ── Test 42 (U-C06): Depth-1 safetensors JSON-key byte scanner (0 json.loads) ──
+
+
+def test_safetensors_depth1_key_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from quantfunc.models.ltx25 import _file_has_both_connectors
+
+    raw = struct.pack("<2f", 1.0, 2.0)
+
+    # 1. Valid wrapped connector keys + unicode/quote escapes, with zero json.loads calls
+    good_st = _write_synthetic_safetensors(
+        tmp_path / "ltx25_connectors_wrapped.safetensors",
+        {
+            "model.diffusion_model.video_embeddings_connector.blocks.0.weight": ("F32", [1, 2], raw),
+            "model.diffusion_model.audio_embeddings_connector.blocks.0.weight": ("F32", [1, 2], raw),
+            "other.weight": ("F32", [1, 2], raw),
+        },
+        metadata={"format": "pt", "desc": 'escaped \\"quote\\" and } { braces'},
+    )
+
+    # 2. Spoofed file: connector strings appear ONLY inside __metadata__ (including escaped quotes & fake JSON)
+    #    and inside a tensor attribute value, NEVER as a depth-1 tensor key.
+    spoof_hdr = (
+        b'{"__metadata__":{'
+        b'"fake":"video_embeddings_connector.blocks.0.weight",'
+        b'"escaped":"foo \\"audio_embeddings_connector.weight\\" \\\\",'
+        b'"injection":"} , \\"video_embeddings_connector.inject\\":{\\"dtype\\":\\"F32\\"}",'
+        b'"nested":{"inner":["audio_embeddings_connector.nested",{"video_connector.deep":1}]}'
+        b'},'
+        b'"normal.weight":{"dtype":"F32","shape":[1,2],"data_offsets":[0,8],'
+        b'"note":"audio_embeddings_connector.attr_spoof \\"video_embeddings_connector.attr\\""}}'
+    )
+    spoof_st = tmp_path / "spoof_metadata.safetensors"
+    spoof_st.write_bytes(struct.pack("<Q", len(spoof_hdr)) + spoof_hdr + raw)
+
+    # 3. Escaped depth-1 key (\u005f == '_')
+    esc_hdr = (
+        b'{"__metadata__":{"ignored":"audio_connector.x"},'
+        b'"video_embeddings\\u005fconnector.proj.weight":{"dtype":"F32","shape":[1,2],"data_offsets":[0,8]}}'
+    )
+    esc_st = tmp_path / "escaped_key.safetensors"
+    esc_st.write_bytes(struct.pack("<Q", len(esc_hdr)) + esc_hdr + raw)
+
+    # 4. Empty JSON object header
+    empty_st = tmp_path / "empty_obj.safetensors"
+    empty_st.write_bytes(struct.pack("<Q", 2) + b"{}")
+
+    # Forbid json.loads across all scanner calls (must be 0 json.loads!)
+    def _forbid_json_loads(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("json.loads must NOT be called by safetensors_header_has_key_markers")
+
+    monkeypatch.setattr(json, "loads", _forbid_json_loads)
+    monkeypatch.setattr(checkpoint.json, "loads", _forbid_json_loads)
+
+    # Substring match hits wrapped connector keys
+    res_sub = checkpoint.safetensors_header_has_key_markers(
+        good_st,
+        ["video_embeddings_connector.", "audio_embeddings_connector.", "missing_marker."],
+        match="substring",
+    )
+    assert res_sub == {
+        "video_embeddings_connector.": True,
+        "audio_embeddings_connector.": True,
+        "missing_marker.": False,
+    }
+
+    # Prefix match distinguishes true prefix from mid-key substring
+    res_pfx = checkpoint.safetensors_header_has_key_markers(
+        good_st,
+        ["model.diffusion_model.", "video_embeddings_connector.", "other."],
+        match="prefix",
+    )
+    assert res_pfx == {
+        "model.diffusion_model.": True,
+        "video_embeddings_connector.": False,
+        "other.": True,
+    }
+
+    # Spoofed __metadata__ and tensor attribute strings MUST all return False
+    res_spoof = checkpoint.safetensors_header_has_key_markers(
+        spoof_st,
+        ["video_embeddings_connector.", "audio_embeddings_connector.", "video_connector.", "normal."],
+        match="substring",
+    )
+    assert res_spoof == {
+        "video_embeddings_connector.": False,
+        "audio_embeddings_connector.": False,
+        "video_connector.": False,
+        "normal.": True,
+    }
+
+    # Escaped depth-1 key decodes without json.loads while ignoring __metadata__
+    res_esc = checkpoint.safetensors_header_has_key_markers(
+        esc_st,
+        ["video_embeddings_connector.", "audio_connector."],
+        match="substring",
+    )
+    assert res_esc == {"video_embeddings_connector.": True, "audio_connector.": False}
+
+    # Empty object & empty markers
+    assert checkpoint.safetensors_header_has_key_markers(empty_st, ["a."], match="prefix") == {"a.": False}
+    assert checkpoint.safetensors_header_has_key_markers(good_st, [], match="substring") == {}
+
+    # ltx25._file_has_both_connectors integration (0 json.loads)
+    assert _file_has_both_connectors(good_st) == (True, True, True)
+    assert _file_has_both_connectors(spoof_st) == (False, False, False)
+    assert _file_has_both_connectors(esc_st) == (False, True, False)
+
+    # Negative / malformed / truncated / oversized header refusals
+    trunc_len = tmp_path / "trunc_len.safetensors"
+    trunc_len.write_bytes(b"\x01\x02\x03")
+    with pytest.raises(ValueError, match="Truncated"):
+        checkpoint.safetensors_header_has_key_markers(trunc_len, ["a."])
+    assert _file_has_both_connectors(trunc_len) == (False, False, False)
+
+    zero_hdr = tmp_path / "zero_hdr.safetensors"
+    zero_hdr.write_bytes(struct.pack("<Q", 0))
+    with pytest.raises(ValueError, match="Implausible"):
+        checkpoint.safetensors_header_has_key_markers(zero_hdr, ["a."])
+
+    oversized = tmp_path / "oversized.safetensors"
+    oversized.write_bytes(struct.pack("<Q", 1024) + b"{}")
+    with pytest.raises(ValueError, match="Implausible"):
+        checkpoint.safetensors_header_has_key_markers(oversized, ["a."], max_header_bytes=64)
+
+    trunc_payload = tmp_path / "trunc_payload.safetensors"
+    trunc_payload.write_bytes(struct.pack("<Q", 100) + b'{"a":1}')
+    with pytest.raises(ValueError, match="Truncated"):
+        checkpoint.safetensors_header_has_key_markers(trunc_payload, ["a"])
+
+    non_obj = tmp_path / "non_obj.safetensors"
+    non_obj.write_bytes(struct.pack("<Q", 7) + b"[1,2,3]")
+    with pytest.raises(ValueError, match="not a JSON object"):
+        checkpoint.safetensors_header_has_key_markers(non_obj, ["a"])
+
+    with pytest.raises(ValueError, match="Unsupported match mode"):
+        checkpoint.safetensors_header_has_key_markers(good_st, ["a"], match="regex")  # type: ignore[arg-type]
+
+    # 5. Whitespace, simple escapes, UTF-16 surrogates, primitives, early-exit & all malformed forms
+    ws_esc_hdr = (
+        b' \t\r\n{\n'
+        b'  "prim_str" : "hello \\"world\\"" ,\n'
+        b'  "prim_num" : -12.5e3 ,\n'
+        b'  "prim_bool" : true ,\n'
+        b'  "prim_null" : null ,\n'
+        b'  "esc_key_\\"\\\\\\/\\b\\f\\n\\r\\t_\\uD83D\\uDE00_\\uD83D\\u0041" : [ 1 , { "x" : 2 } ]\n'
+        b'} \n'
+    )
+    ws_esc_st = tmp_path / "ws_esc.safetensors"
+    ws_esc_st.write_bytes(struct.pack("<Q", len(ws_esc_hdr)) + ws_esc_hdr + raw)
+    res_ws = checkpoint.safetensors_header_has_key_markers(
+        ws_esc_st,
+        ['esc_key_"\\/\b\f\n\r\t_\U0001f600_\ud83dA'],
+        match="prefix",
+    )
+    assert res_ws == {'esc_key_"\\/\b\f\n\r\t_\U0001f600_\ud83dA': True}
+
+    # Early exit when all pending markers match before trailing keys
+    early_hdr = (
+        b'{"video_connector.w":{"dtype":"F32","shape":[1,2],"data_offsets":[0,8]},'
+        b'"bad\\q":{"dtype":"F32"}}'
+    )
+    early_st = tmp_path / "early_exit.safetensors"
+    early_st.write_bytes(struct.pack("<Q", len(early_hdr)) + early_hdr + raw)
+    assert checkpoint.safetensors_header_has_key_markers(early_st, ["video_connector."]) == {
+        "video_connector.": True
+    }
+
+    # Direct _unescape_json_string trailing backslash & strict RFC-8259 \uXXXX checks
+    with pytest.raises(ValueError, match="Unterminated escape"):
+        checkpoint._unescape_json_string(b"abc\\")
+
+    for bad_u in (b"\\u+041", b"\\u 041", b"\\u 41", b"\\u0_41", b"\\uZZZZ", b"\\u12"):
+        with pytest.raises(ValueError, match=r"\\u escape"):
+            checkpoint._unescape_json_string(bad_u)
+        # Parity with stdlib json.loads: RFC-8259 forbids sign/space/underscore in \uXXXX
+        monkeypatch.undo()
+        with pytest.raises(ValueError):
+            json.loads('"' + bad_u.decode("ascii") + '"')
+        monkeypatch.setattr(json, "loads", _forbid_json_loads)
+        monkeypatch.setattr(checkpoint.json, "loads", _forbid_json_loads)
+
+    for bad_surr in (b"\\uD83D\\u+C00", b"\\uD83D\\u 000", b"\\uD83D\\u0_00", b"\\uD83D\\uZZZZ"):
+        with pytest.raises(ValueError, match="surrogate"):
+            checkpoint._unescape_json_string(bad_surr)
+
+    malformed_cases: list[tuple[bytes, str]] = [
+        (b'{"bad\\q":1}', "Invalid escape"),
+        (b'{"unterminated', "Unterminated JSON string"),
+        (b'{"a":', "Unexpected end"),
+        (b'{"a":[1,2', "Unterminated JSON container"),
+        (b'{"a":[1,2}}', "Mismatched JSON container delimiter"),
+        (b'{"a":{]}', "Mismatched JSON container delimiter"),
+        (b'{"a":,}', "Malformed JSON primitive"),
+        (b'{123:1}', "Malformed safetensors header JSON key"),
+        (b'{"\xff\xfe":1}', "Malformed UTF-8"),
+        (b'{"a" 1}', "missing ':'"),
+        (b'{"a":1 ', "Truncated safetensors header JSON"),
+        (b'{"a":1,', "Truncated safetensors header JSON"),
+        (b'{"a":1,}', "Malformed safetensors header JSON key"),
+        (b'{"a":1 "b":2}', "expected ',' or '}'"),
+    ]
+    for idx, (bad_hdr, pat) in enumerate(malformed_cases):
+        bad_p = tmp_path / f"malformed_{idx}.safetensors"
+        bad_p.write_bytes(struct.pack("<Q", len(bad_hdr)) + bad_hdr)
+        with pytest.raises(ValueError, match=pat):
+            checkpoint.safetensors_header_has_key_markers(bad_p, ["never_match"])
+
+
+def test_session_keepalive_reset_and_factory_ordering(fake_qf_lib: FakeQFLib) -> None:
+    from quantfunc.native.errors import OutOfMemoryError
+
+    eng = QFEngineHandle.create(fake_qf_lib, "/fake/m.safetensors", {"model_arch": "krea2"})
+    try:
+        events: list[str] = []
+        tracker = session.AutoSessionTracker(
+            eng,
+            busy_retry_delay_s=0.0,
+            on_session_reset=lambda: events.append("reset"),
+        )
+
+        def _open(num_steps: int, opts: dict[str, Any]) -> Any:
+            events.append("open")
+            return eng.session_begin(256, 256, num_steps, (1, 64, 128), QF_DTYPE_BF16, opts)
+
+        # Round 1: open then sig_id_factory runs AFTER open
+        _, _, k1 = tracker.resolve_step_and_session(
+            0.9,
+            ("g", 1),
+            16,
+            {},
+            _open,
+            sig_id_factory=lambda: (events.append("fp1"), ("ctx", 1))[1],
+        )
+        assert k1 == 1
+        assert events == ["reset", "open", "fp1"]
+
+        # Step 1 same session: no reset/open, computes fp1 -> same key 1
+        events.clear()
+        _, _, k1_b = tracker.resolve_step_and_session(
+            0.5,
+            ("g", 1),
+            16,
+            {},
+            _open,
+            sig_id_factory=lambda: (events.append("fp1_b"), ("ctx", 1))[1],
+        )
+        assert k1_b == 1
+        assert events == ["fp1_b"]
+
+        # Round 2 (sigma increases -> need_open=True): reset MUST fire BEFORE open & sig_id_factory!
+        events.clear()
+        _, _, k2 = tracker.resolve_step_and_session(
+            0.95,
+            ("g", 1),
+            16,
+            {},
+            _open,
+            sig_id_factory=lambda: (events.append("fp2"), ("ctx", 2))[1],
+        )
+        assert k2 == 1
+        assert events == ["reset", "open", "fp2"]
+
+        # Failing open_fn never invokes sig_id_factory and already triggered reset
+        events.clear()
+        fp_called = {"n": 0}
+
+        def _boom_open(num_steps: int, opts: dict[str, Any]) -> Any:
+            raise OutOfMemoryError("oom open")
+
+        with pytest.raises(OutOfMemoryError):
+            tracker.resolve_step_and_session(
+                0.99,
+                ("g", 1),
+                16,
+                {},
+                _boom_open,
+                sig_id_factory=lambda: fp_called.__setitem__("n", fp_called["n"] + 1) or "x",
+            )
+        assert events == ["reset"]
+        assert fp_called["n"] == 0
+
+        # SamplingSession on_session_end fires on __enter__, normal __exit__, error __exit__, and __enter__ failure
+        end_calls = {"n": 0}
+        with session.SamplingSession(
+            eng,
+            tracker=tracker,
+            width=256,
+            height=256,
+            num_steps=3,
+            max_context_dims=(1, 64, 128),
+            cond_dtype=QF_DTYPE_BF16,
+            options={},
+            on_session_end=lambda: end_calls.__setitem__("n", end_calls["n"] + 1),
+        ):
+            assert end_calls["n"] >= 1
+        after_norm = end_calls["n"]
+        assert after_norm >= 2
+
+        with pytest.raises(RuntimeError, match="boom"):
+            with session.SamplingSession(
+                eng,
+                tracker=tracker,
+                width=256,
+                height=256,
+                num_steps=3,
+                max_context_dims=(1, 64, 128),
+                cond_dtype=QF_DTYPE_BF16,
+                options={},
+                on_session_end=lambda: end_calls.__setitem__("n", end_calls["n"] + 1),
+            ):
+                raise RuntimeError("boom")
+        assert end_calls["n"] > after_norm
+
+        # Schedule-only SamplingSession (width=None -> skips session_begin, still invokes on_session_end)
+        before_sched_only = end_calls["n"]
+        with session.SamplingSession(
+            eng,
+            tracker=tracker,
+            sigmas=(1.0, 0.5, 0.0),
+            on_session_end=lambda: end_calls.__setitem__("n", end_calls["n"] + 1),
+        ) as sess_only:
+            assert sess_only.session_handle is None
+        assert end_calls["n"] >= before_sched_only + 2
+
+        orig_begin = eng.session_begin
+
+        def _boom_begin(*args: Any, **kwargs: Any) -> Any:
+            raise OutOfMemoryError("begin boom")
+
+        eng.session_begin = _boom_begin  # type: ignore[method-assign]
+        before_enter_fail = end_calls["n"]
+        with pytest.raises(OutOfMemoryError, match="begin boom"):
+            with session.SamplingSession(
+                eng,
+                tracker=tracker,
+                width=256,
+                height=256,
+                num_steps=3,
+                max_context_dims=(1, 64, 128),
+                cond_dtype=QF_DTYPE_BF16,
+                options={},
+                on_session_end=lambda: end_calls.__setitem__("n", end_calls["n"] + 1),
+            ):
+                pass
+        eng.session_begin = orig_begin  # type: ignore[method-assign]
+        assert end_calls["n"] >= before_enter_fail + 2
+    finally:
+        eng.destroy()

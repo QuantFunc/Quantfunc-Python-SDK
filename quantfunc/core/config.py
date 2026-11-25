@@ -146,7 +146,7 @@ class EngineConfig:
     api_key: str | None = None
     cache_dir: str | None = None
     device_id: int = 0
-    producer_stream_mode: str = "sync"
+    producer_stream_mode: str = "torch_current"
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_arch, str) or not self.model_arch.strip():

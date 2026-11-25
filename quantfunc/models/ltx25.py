@@ -12,7 +12,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from quantfunc.core.checkpoint import PresetMetadata, sniff_safetensors_header
+from quantfunc.core.checkpoint import PresetMetadata, safetensors_header_has_key_markers
 from quantfunc.core.registry import register_model
 from quantfunc.models.base import (
     QuantFuncBaseTransformer,
@@ -40,18 +40,21 @@ _AUDIO_CONNECTOR_MARKERS = (
 )
 
 
-def _header_has_any_marker(header: Mapping[str, Any], markers: tuple[str, ...]) -> bool:
-    return any(any(m in key for m in markers) for key in header if key != "__metadata__")
+_ALL_CONNECTOR_MARKERS = _VIDEO_CONNECTOR_MARKERS + _AUDIO_CONNECTOR_MARKERS
 
 
 def _file_has_both_connectors(path: str | os.PathLike[str]) -> tuple[bool, bool, bool]:
-    """Return (has_both, has_video, has_audio) by reading only the safetensors JSON header."""
+    """Return (has_both, has_video, has_audio) via depth-1 safetensors header key scan (0 json.loads)."""
     try:
-        header = sniff_safetensors_header(path)
+        found = safetensors_header_has_key_markers(
+            path,
+            _ALL_CONNECTOR_MARKERS,
+            match="substring",
+        )
     except Exception:
         return (False, False, False)
-    has_vid = _header_has_any_marker(header, _VIDEO_CONNECTOR_MARKERS)
-    has_aud = _header_has_any_marker(header, _AUDIO_CONNECTOR_MARKERS)
+    has_vid = any(found[m] for m in _VIDEO_CONNECTOR_MARKERS)
+    has_aud = any(found[m] for m in _AUDIO_CONNECTOR_MARKERS)
     return (has_vid and has_aud, has_vid, has_aud)
 
 
@@ -624,45 +627,79 @@ class QuantFuncLTX25Transformer3DModel(QuantFuncBaseTransformer):
             return [base] * batch, None
 
         t_det = timestep.detach().float()
-        if not bool(torch.isfinite(t_det).all().item()):
-            raise ValueError("LTX-2.5 video timestep must be finite")
-        if bool((t_det < 0.0).any().item()):
-            raise ValueError("LTX-2.5 video timestep must be non-negative")
-
         if t_det.ndim <= _RANK_1D:
-            raw_sigmas = self._extract_batch_sigmas(
-                sigma_override if sigma_override is not None else t_det,
-                batch,
-            )
-            return raw_sigmas, None
+            t_vals = t_det.reshape(-1).cpu().tolist()
+            for v in t_vals:
+                fv = float(v)
+                if not math.isfinite(fv):
+                    raise ValueError("LTX-2.5 video timestep must be finite")
+                if fv < 0.0:
+                    raise ValueError("LTX-2.5 video timestep must be non-negative")
+            if sigma_override is not None:
+                return self._extract_batch_sigmas(sigma_override, batch), None
+            if len(t_vals) == 0:
+                raise ValueError("timestep tensor must be non-empty")
+            if len(t_vals) == 1:
+                return [self._normalize_scalar_sigma(float(t_vals[0]))] * batch, None
+            if len(t_vals) >= batch:
+                return [self._normalize_scalar_sigma(float(t_vals[i])) for i in range(batch)], None
+            raise ValueError(f"timestep length {len(t_vals)} does not match batch size {batch}")
 
         # Multi-dimensional video_timestep: [B, N_vid], [B, F], or [B, F, H, W] / [B, C, F, H, W]
         if int(t_det.shape[0]) != batch:
             raise ValueError(
                 f"LTX-2.5 multi-dim video_timestep batch {int(t_det.shape[0])} != {batch}"
             )
-        sigmas_out: list[float] = []
-        per_batch_scales: list[list[float]] = []
         frame_tokens = pph * ppw
+        per_item_shape = tuple(int(d) for d in t_det.shape[1:])
+        per_item_numel = int(t_det[0].numel()) if batch > 0 else 0
 
-        for b in range(batch):
-            tb = t_det[b]
-            if tb.ndim == _RANK_4D:
-                # [C, F, H, W] -> [F, C*H*W]
-                tb_frames = tb.movedim(1, 0).reshape(ppf, -1)
-            elif tb.numel() == ppf * frame_tokens:
-                tb_frames = tb.reshape(ppf, frame_tokens)
-            elif tb.numel() == ppf:
-                tb_frames = tb.reshape(ppf, 1)
-            else:
+        if len(per_item_shape) == _RANK_4D:
+            # [B, C, F, H, W] -> [B, F, C*H*W]
+            if per_item_numel <= 0 or per_item_numel % ppf != 0:
                 raise ValueError(
-                    f"LTX-2.5 video_timestep per-item shape {tuple(tb.shape)} does not match "
+                    f"LTX-2.5 video_timestep per-item shape {per_item_shape} does not match "
                     f"ppf={ppf} or ppf*pph*ppw={ppf * frame_tokens}"
                 )
+            t_frames = t_det.movedim(2, 1).reshape(batch, ppf, -1)
+        elif per_item_numel == ppf * frame_tokens:
+            t_frames = t_det.reshape(batch, ppf, frame_tokens)
+        elif per_item_numel == ppf:
+            t_frames = t_det.reshape(batch, ppf, 1)
+        else:
+            raise ValueError(
+                f"LTX-2.5 video_timestep per-item shape {per_item_shape} does not match "
+                f"ppf={ppf} or ppf*pph*ppw={ppf * frame_tokens}"
+            )
 
-            raw_max = float(tb_frames.max().item())
+        # Single vectorized D2H sync for all batch items and frames (amin/amax propagate NaN/Inf).
+        bounds = torch.stack([t_frames.amin(dim=-1), t_frames.amax(dim=-1)], dim=-1).cpu().tolist()
+        ov_vals = (
+            sigma_override.detach().float().reshape(-1).cpu().tolist()
+            if sigma_override is not None and torch.is_tensor(sigma_override)
+            else None
+        )
+
+        sigmas_out: list[float] = []
+        per_batch_scales: list[list[float]] = []
+        for b in range(batch):
+            frame_bounds = bounds[b]
+            raw_max = 0.0
+            for lo_raw, hi_raw in frame_bounds:
+                lo_f = float(lo_raw)
+                hi_f = float(hi_raw)
+                if not math.isfinite(lo_f) or not math.isfinite(hi_f):
+                    raise ValueError("LTX-2.5 video timestep must be finite")
+                if lo_f < 0.0 or hi_f < 0.0:
+                    raise ValueError("LTX-2.5 video timestep must be non-negative")
+                if hi_f > raw_max:
+                    raw_max = hi_f
+
             if sigma_override is not None:
-                ov = float(sigma_override[b].item()) if torch.is_tensor(sigma_override) and sigma_override.numel() > 1 else float(sigma_override)
+                if ov_vals is not None:
+                    ov = float(ov_vals[b] if len(ov_vals) > 1 else ov_vals[0])
+                else:
+                    ov = float(sigma_override)
                 sig_norm = self._normalize_scalar_sigma(ov)
                 scale_denom = ov if ov > 0.0 else raw_max
             else:
@@ -671,14 +708,13 @@ class QuantFuncLTX25Transformer3DModel(QuantFuncBaseTransformer):
             sigmas_out.append(sig_norm)
 
             scales_b: list[float] = []
-            for f in range(ppf):
-                row = tb_frames[f]
+            for f, (lo_raw, hi_raw) in enumerate(frame_bounds):
                 if scale_denom > 0.0:
-                    sc_row = row / scale_denom
+                    lo = float(lo_raw) / scale_denom
+                    hi = float(hi_raw) / scale_denom
                 else:
-                    sc_row = torch.ones_like(row)
-                lo = float(sc_row.min().item())
-                hi = float(sc_row.max().item())
+                    lo = 1.0
+                    hi = 1.0
                 if hi - lo > _FRAME_SCALE_VARIANCE_TOL:
                     raise ValueError(
                         f"LTX-2.5 video_timestep varies within latent frame {f} "
@@ -709,13 +745,15 @@ class QuantFuncLTX25Transformer3DModel(QuantFuncBaseTransformer):
             return None
 
         at = audio_timestep.detach().float()
-        if not bool(torch.isfinite(at).all().item()):
-            raise ValueError("LTX-2.5 audio_timestep must be finite")
-        if bool((at < 0.0).any().item()):
-            raise ValueError("LTX-2.5 audio_timestep must be non-negative")
         if at.ndim <= _RANK_1D:
-            for val in at.reshape(-1).tolist():
-                _ = self._normalize_scalar_sigma(float(val))
+            at_vals = at.reshape(-1).cpu().tolist()
+            for val in at_vals:
+                fv = float(val)
+                if not math.isfinite(fv):
+                    raise ValueError("LTX-2.5 audio_timestep must be finite")
+                if fv < 0.0:
+                    raise ValueError("LTX-2.5 audio_timestep must be non-negative")
+                _ = self._normalize_scalar_sigma(fv)
             return None
 
         if int(at.shape[0]) != batch:
@@ -723,31 +761,48 @@ class QuantFuncLTX25Transformer3DModel(QuantFuncBaseTransformer):
                 f"LTX-2.5 audio_timestep batch {int(at.shape[0])} != {batch}"
             )
         aud_ch, mel_bins = self._audio_unpacked_geometry()
+        per_item_shape = tuple(int(d) for d in at.shape[1:])
+        per_item_numel = int(at[0].numel()) if batch > 0 else 0
+
+        if len(per_item_shape) == _RANK_3D and per_item_shape == (aud_ch, audio_rows, mel_bins):
+            at_rows = at.movedim(2, 1).reshape(batch, audio_rows, aud_ch * mel_bins)
+        elif len(per_item_shape) == _RANK_2D and per_item_shape[0] == audio_rows and per_item_shape[1] > 0:
+            at_rows = at
+        elif per_item_numel == audio_rows:
+            at_rows = at.reshape(batch, audio_rows, 1)
+        elif per_item_numel > 0 and per_item_numel % audio_rows == 0:
+            at_rows = at.reshape(batch, audio_rows, per_item_numel // audio_rows)
+        else:
+            raise ValueError(
+                f"LTX-2.5 audio_timestep per-item shape {per_item_shape} does not align with audio_rows={audio_rows}"
+            )
+
+        # Single vectorized D2H sync for all batch items and audio rows (amin/amax propagate NaN/Inf).
+        bounds = torch.stack([at_rows.amin(dim=-1), at_rows.amax(dim=-1)], dim=-1).cpu().tolist()
+
         per_batch_scales: list[list[float]] = []
-
         for b in range(batch):
-            ab = at[b]
-            if ab.ndim == _RANK_3D and tuple(int(d) for d in ab.shape) == (aud_ch, audio_rows, mel_bins):
-                ab_rows = ab.movedim(1, 0).reshape(audio_rows, aud_ch * mel_bins)
-            elif ab.ndim == _RANK_2D and int(ab.shape[0]) == audio_rows:
-                ab_rows = ab
-            elif ab.numel() == audio_rows:
-                ab_rows = ab.reshape(audio_rows, 1)
-            elif ab.numel() % audio_rows == 0:
-                ab_rows = ab.reshape(audio_rows, ab.numel() // audio_rows)
-            else:
-                raise ValueError(
-                    f"LTX-2.5 audio_timestep per-item shape {tuple(ab.shape)} does not align with audio_rows={audio_rows}"
-                )
+            row_bounds = bounds[b]
+            raw_max = 0.0
+            for lo_raw, hi_raw in row_bounds:
+                lo_f = float(lo_raw)
+                hi_f = float(hi_raw)
+                if not math.isfinite(lo_f) or not math.isfinite(hi_f):
+                    raise ValueError("LTX-2.5 audio_timestep must be finite")
+                if lo_f < 0.0 or hi_f < 0.0:
+                    raise ValueError("LTX-2.5 audio_timestep must be non-negative")
+                if hi_f > raw_max:
+                    raw_max = hi_f
 
-            raw_max = float(ab_rows.max().item())
             denom = raw_max if raw_max > 0.0 else video_sigmas[b]
             scales_b: list[float] = []
-            for r in range(audio_rows):
-                row = ab_rows[r]
-                sc_row = (row / denom) if denom > 0.0 else torch.ones_like(row)
-                lo = float(sc_row.min().item())
-                hi = float(sc_row.max().item())
+            for r, (lo_raw, hi_raw) in enumerate(row_bounds):
+                if denom > 0.0:
+                    lo = float(lo_raw) / denom
+                    hi = float(hi_raw) / denom
+                else:
+                    lo = 1.0
+                    hi = 1.0
                 if hi - lo > _FRAME_SCALE_VARIANCE_TOL:
                     raise ValueError(
                         f"LTX-2.5 audio_timestep varies within audio row {r} "
@@ -887,100 +942,102 @@ class QuantFuncLTX25Transformer3DModel(QuantFuncBaseTransformer):
         cond_qf_dtype = _torch_dtype_to_qf(ctx_in.dtype)
 
         for i in range(batch):
-            vi = vid_in[i : i + 1].contiguous()
-            vo = self._ensure_scratch("ltx25_vid_out", tuple(vi.shape), vi.dtype, dev)
-            ci = ctx_in[i : i + 1].contiguous()
-            sig_i = sigmas[i]
-            ctx_id = self._context_fingerprint(ci, i)
+            with self._step_error_cleanup():
+                vi = vid_in[i : i + 1].contiguous()
+                vo = self._ensure_scratch("ltx25_vid_out", tuple(vi.shape), vi.dtype, dev)
+                ci = ctx_in[i : i + 1].contiguous()
+                sig_i = sigmas[i]
 
-            opts = self._build_base_session_options(
-                has_refs=False,
-                batch=batch,
-                single_cond_group=(batch == 1),
-            )
-            opts["num_frames"] = int(eff_num_frames)
-            opts["fps"] = float(eff_fps)
-            opts["av_unprocessed_ctx"] = bool(eff_unprocessed)
-            if aud_3d is not None:
-                opts["audio_dims"] = [1, int(audio_rows), int(aud_pack)]
-            if frame_t_scales is not None:
-                opts["frame_t_scales"] = list(frame_t_scales)
-            if audio_frame_t_scales is not None:
-                opts["audio_frame_t_scales"] = list(audio_frame_t_scales)
-            if cur_stg:
-                opts["stg_blocks"] = list(cur_stg)
-            if cur_disable_av:
-                opts["disable_av_cross_attn"] = True
-
-            before_cb = None
-            after_cb = None
-            if ref_active and self._ref_audio_state is not None:
-                upload = self._ref_audio_state[-1]
-                opts["av_conds"] = [
-                    {
-                        "kind": "audio",
-                        "audio_latent_ptr": hex(upload.data_ptr()),
-                        "audio_latent_dims": [int(d) for d in upload.shape],
-                        "audio_latent_dtype": int(_torch_dtype_to_qf(upload.dtype)),
-                    }
-                ]
-
-                def _before_ref(u: torch.Tensor = upload) -> None:
-                    self._handle.retain_reference_audio(u)
-
-                def _after_ref() -> None:
-                    self._handle.reference_audio_copy_completed()
-                    self._ref_audio_bound = True
-
-                before_cb = _before_ref
-                after_cb = _after_ref
-
-            step_idx, total_steps, ctx_key = self._ensure_session_step(
-                width=pixel_w,
-                height=pixel_h,
-                sigma=sig_i,
-                max_context_dims=self._max_context_dims_for(ci),
-                cond_dtype=cond_qf_dtype,
-                options=opts,
-                geometry_key=geom_key,
-                ctx_identity=ctx_id,
-                producer_stream=stream_ptr,
-                allow_busy_retry=not ref_active,
-                before_begin=before_cb,
-                after_begin=after_cb,
-            )
-            self._bound_stg_blocks = cur_stg
-            self._bound_disable_av_cross_attn = cur_disable_av
-
-            if aud_3d is not None and out_aud_3d is not None:
-                ai = aud_3d[i : i + 1].to(device=dev, dtype=torch.float32).contiguous()
-                ao = self._ensure_scratch("ltx25_aud_out", (1, audio_rows, aud_pack), torch.float32, dev)
-                self._run_step_av(
-                    latent_in=vi,
-                    velocity_out=vo,
-                    audio_latent_in=ai,
-                    audio_velocity_out=ao,
-                    sigma=sig_i,
-                    step_index=step_idx,
-                    total_steps=total_steps,
-                    context=ci,
-                    cfg_context_key=ctx_key,
-                    audio_scale=1.0,
-                    audio_reference_active=1 if (ref_active and self._ref_audio_bound) else 0,
-                    producer_stream=stream_ptr,
+                opts = self._build_base_session_options(
+                    has_refs=False,
+                    batch=batch,
+                    single_cond_group=(batch == 1),
                 )
-                out_aud_3d[i : i + 1] = ao
-            else:
-                self._run_step(
-                    latent_in=vi,
-                    velocity_out=vo,
+                opts["num_frames"] = int(eff_num_frames)
+                opts["fps"] = float(eff_fps)
+                opts["av_unprocessed_ctx"] = bool(eff_unprocessed)
+                if aud_3d is not None:
+                    opts["audio_dims"] = [1, int(audio_rows), int(aud_pack)]
+                if frame_t_scales is not None:
+                    opts["frame_t_scales"] = list(frame_t_scales)
+                if audio_frame_t_scales is not None:
+                    opts["audio_frame_t_scales"] = list(audio_frame_t_scales)
+                if cur_stg:
+                    opts["stg_blocks"] = list(cur_stg)
+                if cur_disable_av:
+                    opts["disable_av_cross_attn"] = True
+
+                before_cb = None
+                after_cb = None
+                if ref_active and self._ref_audio_state is not None:
+                    upload = self._ref_audio_state[-1]
+                    opts["av_conds"] = [
+                        {
+                            "kind": "audio",
+                            "audio_latent_ptr": hex(upload.data_ptr()),
+                            "audio_latent_dims": [int(d) for d in upload.shape],
+                            "audio_latent_dtype": int(_torch_dtype_to_qf(upload.dtype)),
+                        }
+                    ]
+
+                    def _before_ref(u: torch.Tensor = upload) -> None:
+                        self._handle.retain_reference_audio(u)
+
+                    def _after_ref() -> None:
+                        self._handle.reference_audio_copy_completed()
+                        self._ref_audio_bound = True
+
+                    before_cb = _before_ref
+                    after_cb = _after_ref
+
+                step_idx, total_steps, ctx_key = self._ensure_session_step(
+                    width=pixel_w,
+                    height=pixel_h,
                     sigma=sig_i,
-                    step_index=step_idx,
-                    total_steps=total_steps,
-                    context=ci,
-                    cfg_context_key=ctx_key,
+                    max_context_dims=self._max_context_dims_for(ci),
+                    cond_dtype=cond_qf_dtype,
+                    options=opts,
+                    geometry_key=geom_key,
+                    ctx_identity_factory=lambda idx=i: self._context_fingerprint(
+                        (encoder_hidden_states, audio_encoder_hidden_states), idx
+                    ),
                     producer_stream=stream_ptr,
+                    allow_busy_retry=not ref_active,
+                    before_begin=before_cb,
+                    after_begin=after_cb,
                 )
+                self._bound_stg_blocks = cur_stg
+                self._bound_disable_av_cross_attn = cur_disable_av
+
+                if aud_3d is not None and out_aud_3d is not None:
+                    ai = aud_3d[i : i + 1].to(device=dev, dtype=torch.float32).contiguous()
+                    ao = self._ensure_scratch("ltx25_aud_out", (1, audio_rows, aud_pack), torch.float32, dev)
+                    self._run_step_av(
+                        latent_in=vi,
+                        velocity_out=vo,
+                        audio_latent_in=ai,
+                        audio_velocity_out=ao,
+                        sigma=sig_i,
+                        step_index=step_idx,
+                        total_steps=total_steps,
+                        context=ci,
+                        cfg_context_key=ctx_key,
+                        audio_scale=1.0,
+                        audio_reference_active=1 if (ref_active and self._ref_audio_bound) else 0,
+                        producer_stream=stream_ptr,
+                    )
+                    out_aud_3d[i : i + 1] = ao
+                else:
+                    self._run_step(
+                        latent_in=vi,
+                        velocity_out=vo,
+                        sigma=sig_i,
+                        step_index=step_idx,
+                        total_steps=total_steps,
+                        context=ci,
+                        cfg_context_key=ctx_key,
+                        producer_stream=stream_ptr,
+                    )
             out_vid_3d[i : i + 1] = vo
 
         if vid_was_5d:

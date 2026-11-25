@@ -10,6 +10,7 @@ from .checkpoint import (
     name_matches_hints,
     resolve_checkpoint,
     resolve_transformer_config,
+    safetensors_header_has_key_markers,
     sniff_safetensors_header,
 )
 from .config import (
@@ -117,6 +118,7 @@ __all__ = [
     # checkpoint
     "PresetMetadata",
     "name_matches_hints",
+    "safetensors_header_has_key_markers",
     "sniff_safetensors_header",
     "bundled_presets_root",
     "list_bundled_presets",
