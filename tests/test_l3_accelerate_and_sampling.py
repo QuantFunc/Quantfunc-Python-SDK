@@ -1881,6 +1881,32 @@ for bad_t in (0, torch.tensor(0, dtype=torch.long)):
         except ValueError:
             pass
 
+# Pure-PyTorch fallback: min_step_ratio default, from_config, setter, deepcopy, stiff LTX-2.5 fallback & validation
+assert sched.min_step_ratio == 0.35
+sc_pt_cfg = FlowMatchResMultistepScheduler.from_config({"shift": 1.0}, min_step_ratio=0.25)
+assert sc_pt_cfg.min_step_ratio == 0.25
+assert copy.deepcopy(sc_pt_cfg).min_step_ratio == 0.25
+ltx_sig = [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875]
+sc_pt_guard = FlowMatchResMultistepScheduler(min_step_ratio=0.35)
+sc_pt_guard.set_timesteps(sigmas=ltx_sig)
+xp = torch.ones(1, 2, 4, 4)
+for idx_p, tp in enumerate(sc_pt_guard.timesteps):
+    scur = float(sc_pt_guard.sigmas[idx_p].item())
+    snxt = float(sc_pt_guard.sigmas[idx_p + 1].item())
+    vp = 0.4 * xp + (0.25 if idx_p % 2 == 0 else -0.25)
+    euler_p = xp + (snxt - scur) * vp
+    xp = sc_pt_guard.step(vp, tp, xp, return_dict=False)[0]
+    if idx_p in (4, 5):
+        assert (xp - euler_p).abs().max().item() < 1e-6, f"Pure-torch stiff step {idx_p} did not fall back to Euler"
+for bad_r in (-0.1, float("nan"), float("inf"), float("-inf"), True, "0.35"):
+    try:
+        FlowMatchResMultistepScheduler(min_step_ratio=bad_r)
+        raise SystemExit(f"Expected ValueError for min_step_ratio={bad_r!r}")
+    except ValueError:
+        pass
+sc_pt_cfg.min_step_ratio = 0.5
+assert sc_pt_cfg.min_step_ratio == 0.5
+
 assert sys.modules["diffusers"] is None
 """
     env = dict(os.environ)
@@ -1970,6 +1996,285 @@ def test_use_res_multistep_scheduler_and_mutation_arms() -> None:
     clean_clone = copy.deepcopy(sc_iso)
     assert clean_clone._old_denoised is None and clean_clone._prev_sigma is None
     assert math.isfinite(float(sc_iso._prev_sigma or 0.0))
+
+
+def test_renoise_cpu_generator_cross_device_and_fp16_safety(monkeypatch: pytest.MonkeyPatch) -> None:
+    renoise = FlowMatchRenoise()
+    x0_f32 = torch.full((1, 4, 8, 8), 1.5, dtype=torch.float32)
+
+    # (1) Deterministic CPU generator reproducibility + exact formula
+    g1 = torch.Generator(device="cpu").manual_seed(2026)
+    g2 = torch.Generator(device="cpu").manual_seed(2026)
+    g_ref = torch.Generator(device="cpu").manual_seed(2026)
+    out1 = renoise(x0_f32, 0.4, generator=g1)
+    out2 = renoise(x0_f32, 0.4, generator=g2)
+    ref_eps = torch.randn(x0_f32.shape, generator=g_ref, device="cpu", dtype=torch.float32)
+    assert torch.equal(out1, out2)
+    assert torch.allclose(out1, 0.6 * x0_f32 + 0.4 * ref_eps)
+
+    # (2) CPU float16 latent with CPU generator samples in fp32 then casts back to fp16 cleanly
+    x0_f16 = torch.full((1, 4, 8, 8), 1.5, dtype=torch.float16)
+    seen_calls: list[dict[str, Any]] = []
+    real_randn = torch.randn
+
+    def _spy_randn(shape: Any, *, generator: Any = None, device: Any = None, dtype: Any = None) -> torch.Tensor:
+        seen_calls.append({"shape": tuple(shape), "generator": generator, "device": device, "dtype": dtype})
+        return real_randn(shape, generator=generator, device=device, dtype=dtype)
+
+    monkeypatch.setattr(torch, "randn", _spy_randn)
+    g_fp16 = torch.Generator(device="cpu").manual_seed(77)
+    out_f16 = renoise(x0_f16, 0.3, generator=g_fp16)
+    assert out_f16.dtype == torch.float16 and out_f16.device == x0_f16.device
+    assert torch.isfinite(out_f16).all()
+    assert seen_calls[-1]["device"] == torch.device("cpu")
+    assert seen_calls[-1]["dtype"] == torch.float32
+
+    # (3) Cross-device contract: when latent claims a non-CPU device (e.g. CUDA) and generator is on CPU,
+    #     torch.randn MUST be invoked on generator.device ("cpu") and cast/moved back to latent's device/dtype.
+    fake_cuda = torch.device("meta")
+
+    class _FakeCrossDeviceTensor:
+        """Minimal tensor wrapper simulating a CUDA latent on CPU-only test runners."""
+
+        def __init__(self, backing: torch.Tensor, logical_device: torch.device) -> None:
+            self._backing = backing
+            self.device = logical_device
+            self.dtype = backing.dtype
+            self.shape = backing.shape
+            self.ndim = backing.ndim
+
+        def __rmul__(self, scalar: float) -> _FakeCrossDeviceTensor:
+            return _FakeCrossDeviceTensor(scalar * self._backing, self.device)
+
+        def __add__(self, other: Any) -> torch.Tensor:
+            assert isinstance(other, _MovedTensor) and other.target_device == self.device
+            return self._backing + other.backing
+
+    class _MovedTensor:
+        def __init__(self, backing: torch.Tensor, target_device: torch.device, target_dtype: torch.dtype) -> None:
+            self.backing = backing.to(dtype=target_dtype)
+            self.target_device = target_device
+            self.target_dtype = target_dtype
+
+        def __rmul__(self, scalar: float) -> _MovedTensor:
+            return _MovedTensor(scalar * self.backing, self.target_device, self.target_dtype)
+
+    class _SpyCpuTensor:
+        def __init__(self, backing: torch.Tensor) -> None:
+            self._backing = backing
+            self.device = backing.device
+            self.dtype = backing.dtype
+
+        def to(self, *, device: torch.device, dtype: torch.dtype) -> _MovedTensor:
+            return _MovedTensor(self._backing, device, dtype)
+
+    def _strict_cross_device_randn(
+        shape: Any,
+        *,
+        generator: Any = None,
+        device: Any = None,
+        dtype: Any = None,
+    ) -> Any:
+        # Mirror PyTorch's exact CUDA-vs-CPU generator device check!
+        if isinstance(generator, torch.Generator) and torch.device(device) != generator.device:
+            raise RuntimeError(
+                f"Expected a '{device}' device type for generator but found '{generator.device.type}'"
+            )
+        return _SpyCpuTensor(real_randn(shape, generator=generator, device=device, dtype=dtype))
+
+    monkeypatch.setattr(torch, "randn", _strict_cross_device_randn)
+    fake_lat = _FakeCrossDeviceTensor(torch.ones(1, 2, 4, 4, dtype=torch.bfloat16), fake_cuda)
+    g_cpu = torch.Generator(device="cpu").manual_seed(99)
+    res_cross = renoise.renoise_tensor(fake_lat, 0.5, generator=g_cpu)  # type: ignore[arg-type]
+    assert isinstance(res_cross, torch.Tensor) and res_cross.dtype == torch.bfloat16 and torch.isfinite(res_cross).all()
+
+    # Combined boundary: cross-device (non-CPU latent) + float16 + CPU generator MUST sample fp32 on CPU then move/cast to fp16
+    cross_f16_dtypes: list[tuple[Any, Any]] = []
+
+    def _spy_cross_f16_randn(
+        shape: Any,
+        *,
+        generator: Any = None,
+        device: Any = None,
+        dtype: Any = None,
+    ) -> Any:
+        cross_f16_dtypes.append((torch.device(device), dtype))
+        return _strict_cross_device_randn(shape, generator=generator, device=device, dtype=dtype)
+
+    monkeypatch.setattr(torch, "randn", _spy_cross_f16_randn)
+    fake_lat_f16 = _FakeCrossDeviceTensor(torch.ones(1, 2, 4, 4, dtype=torch.float16), fake_cuda)
+    res_cross_f16 = renoise.renoise_tensor(fake_lat_f16, 0.5, generator=torch.Generator(device="cpu").manual_seed(101))  # type: ignore[arg-type]
+    assert cross_f16_dtypes[-1] == (torch.device("cpu"), torch.float32)
+    assert isinstance(res_cross_f16, torch.Tensor) and res_cross_f16.dtype == torch.float16 and torch.isfinite(res_cross_f16).all()
+
+    # Mutation arm: passing latent.device (fake_cuda) directly to torch.randn with CPU generator MUST raise RuntimeError
+    with pytest.raises(RuntimeError, match="device type for generator"):
+        _strict_cross_device_randn(fake_lat.shape, generator=g_cpu, device=fake_lat.device, dtype=fake_lat.dtype)
+
+    # Restore real randn and verify LatentBundle with renoise_audio=True and CPU generator
+    monkeypatch.setattr(torch, "randn", real_randn)
+    b = LatentBundle(video_or_image=torch.ones(1, 2, 4, 4), audio=torch.ones(1, 2, 4, 4))
+    b_out = renoise(b, 0.25, generator=torch.Generator(device="cpu").manual_seed(5), renoise_audio=True)
+    assert not torch.equal(b_out.audio, b.audio)
+    assert torch.isfinite(b_out.video_or_image).all() and torch.isfinite(b_out.audio).all()
+
+
+def test_res_multistep_stiff_schedule_guard_and_smooth_parity() -> None:
+    pytest.importorskip("diffusers")
+
+    # (1) Default min_step_ratio is 0.35; smooth schedules stay BIT-FOR-BIT identical (< 1e-6)
+    #     to both min_step_ratio=0.0 and independent ComfyUI sample_res_multistep reference.
+    smooth_schedules = {
+        "krea2_20": build_linear_sigmas(20, shift=3.0)[:-1],
+        "qi21_6": build_linear_sigmas(6, shift=3.0)[:-1],
+        "qi21_25": build_linear_sigmas(25, shift=3.0)[:-1],
+        "minimax_h3_10": build_linear_sigmas(10, shift=3.0)[:-1],
+    }
+    x_init = torch.randn(1, 4, 6, 6, generator=torch.Generator().manual_seed(321), dtype=torch.float32)
+
+    def _smooth_vel(x: torch.Tensor, sigma: float) -> torch.Tensor:
+        return 0.55 * x - 0.3 * torch.sin(x) + 0.12 * sigma
+
+    for label, sig_list in smooth_schedules.items():
+        sc_default = FlowMatchResMultistepScheduler()
+        sc_raw = FlowMatchResMultistepScheduler(min_step_ratio=0.0)
+        assert sc_default.min_step_ratio == pytest.approx(0.35)
+        assert sc_raw.min_step_ratio == pytest.approx(0.0)
+        sc_default.set_timesteps(sigmas=sig_list)
+        sc_raw.set_timesteps(sigmas=sig_list)
+        ref_final, _ = _comfy_res_multistep_reference(x_init, torch.tensor([*sig_list, 0.0]), _smooth_vel)
+
+        x_def = x_init.clone()
+        x_raw = x_init.clone()
+        for i, (td, tr) in enumerate(zip(sc_default.timesteps, sc_raw.timesteps, strict=True)):
+            sd = float(sc_default.sigmas[i].item())
+            x_def = sc_default.step(_smooth_vel(x_def, sd), td, x_def, return_dict=False)[0]
+            x_raw = sc_raw.step(_smooth_vel(x_raw, sd), tr, x_raw, return_dict=False)[0]
+        assert (x_def - x_raw).abs().max().item() < 1e-6, f"{label}: default diverged from raw"
+        assert (x_def - ref_final).abs().max().item() < 1e-6, f"{label}: default diverged from ComfyUI ref"
+
+    # (2) Stiff non-uniform distilled LTX-2.5 schedule:
+    #     steps 4 (|c2|=0.0917) and 5 (|c2|=0.3075) fall back cleanly to 1st-order Euler,
+    #     while smooth steps 1, 2, 3 (|c2|~0.994) and 6 (|c2|=0.4184) execute exact 2nd-order res_multistep!
+    ltx_sigmas = [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875]
+
+    def _perturbed_vel(x: torch.Tensor, sigma: float, step_idx: int) -> torch.Tensor:
+        # Small realistic step-to-step denoised shift exposes 11.6x unguarded extrapolation at step 4
+        return 0.4 * x + (0.25 if step_idx % 2 == 0 else -0.25)
+
+    def _run_ltx_trace(min_ratio: float) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        sc = FlowMatchResMultistepScheduler(min_step_ratio=min_ratio)
+        sc.set_timesteps(sigmas=ltx_sigmas)
+        cur = x_init.clone()
+        xs: list[torch.Tensor] = []
+        euler_refs: list[torch.Tensor] = []
+        for i, t in enumerate(sc.timesteps):
+            s_cur = float(sc.sigmas[i].item())
+            s_nxt = float(sc.sigmas[i + 1].item())
+            v = _perturbed_vel(cur, s_cur, i)
+            euler_refs.append(cur + (s_nxt - s_cur) * v)
+            cur = sc.step(v, t, cur, return_dict=False)[0]
+            xs.append(cur.clone())
+        return xs, euler_refs
+
+    xs_guarded, euler_guarded = _run_ltx_trace(0.35)
+    xs_raw, euler_raw = _run_ltx_trace(0.0)
+
+    # Steps 1, 2, 3 (|c2| ~= 0.994 >= 0.35): guarded == raw (exact 2nd-order res_multistep)
+    for i in (0, 1, 2, 3):
+        assert (xs_guarded[i] - xs_raw[i]).abs().max().item() < 1e-6
+
+    # Steps 4 & 5 (|c2| = 0.0917 & 0.3075 < 0.35): guarded matches exact Euler fallback
+    assert (xs_guarded[4] - euler_guarded[4]).abs().max().item() < 1e-6
+    assert (xs_guarded[5] - euler_guarded[5]).abs().max().item() < 1e-6
+
+    # Step 6 (|c2| = 0.4184 >= 0.35): guarded RESUMES true 2nd-order res_multistep (diverges from Euler!)
+    assert (xs_guarded[6] - euler_guarded[6]).abs().max().item() > 1e-3
+
+    # Step 4 amplification check + MUTATION ARM:
+    # Unguarded (min_step_ratio=0.0) amplifies denoised difference > 5x relative to Euler step delta;
+    # Guarded (min_step_ratio=0.35) keeps step-4 deviation from Euler at 0.0!
+    raw_step4_spike = (xs_raw[4] - euler_raw[4]).abs().max().item()
+    guarded_step4_spike = (xs_guarded[4] - euler_guarded[4]).abs().max().item()
+    assert guarded_step4_spike < 1e-5
+    with pytest.raises(AssertionError):
+        assert raw_step4_spike < 0.05  # Mutation (min_step_ratio=0.0) turns RED with ~0.18+ overshoot!
+
+    # (3) Constant-x0 exact flow-matching recovery holds (< 1e-6) on LTX-2.5 stiff schedule with guard ON!
+    x_clean = torch.randn(1, 4, 6, 6, generator=torch.Generator().manual_seed(456))
+    eps = torch.randn(1, 4, 6, 6, generator=torch.Generator().manual_seed(789))
+    v_const = eps - x_clean
+    sc_ltx_inv = FlowMatchResMultistepScheduler()
+    sc_ltx_inv.set_timesteps(sigmas=ltx_sigmas)
+    x_flow = (1.0 - ltx_sigmas[0]) * x_clean + ltx_sigmas[0] * eps
+    for i, t in enumerate(sc_ltx_inv.timesteps):
+        x_flow = sc_ltx_inv.step(v_const, t, x_flow, return_dict=False)[0]
+        s_nxt = float(sc_ltx_inv.sigmas[i + 1].item())
+        assert (x_flow - ((1.0 - s_nxt) * x_clean + s_nxt * eps)).abs().max().item() < 1e-6
+    assert (x_flow - x_clean).abs().max().item() < 1e-6
+
+    # (4) from_config, property setter, copy.deepcopy preservation + EFFECTIVE step() behavior,
+    #     strict `abs(c2) < min_step_ratio` boundary, int acceptance, and negative validation
+    # On LTX-2.5 sigmas: step 5 has |c2|=0.3075, step 6 has |c2|=0.4184.
+    #   - min_step_ratio=0.25 -> step 5 runs 2nd-order res_multistep (diverges from Euler), step 4 (0.0917) falls back to Euler
+    #   - min_step_ratio=0.50 -> BOTH step 5 (0.3075) and step 6 (0.4184) fall back to Euler!
+    sc_cfg = FlowMatchResMultistepScheduler.from_config({"shift": 1.0}, min_step_ratio=0.25)
+    assert sc_cfg.min_step_ratio == pytest.approx(0.25)
+    sc_cfg.set_timesteps(sigmas=ltx_sigmas)
+    cur_25 = x_init.clone()
+    step5_diff_25 = 0.0
+    for i, t in enumerate(sc_cfg.timesteps):
+        s_cur, s_nxt = float(sc_cfg.sigmas[i].item()), float(sc_cfg.sigmas[i + 1].item())
+        v = _perturbed_vel(cur_25, s_cur, i)
+        e_ref = cur_25 + (s_nxt - s_cur) * v
+        cur_25 = sc_cfg.step(v, t, cur_25, return_dict=False)[0]
+        if i == 5:
+            step5_diff_25 = (cur_25 - e_ref).abs().max().item()
+    assert step5_diff_25 > 1e-3, "from_config(min_step_ratio=0.25) must keep step 5 (|c2|=0.3075) 2nd-order"
+
+    sc_cfg.min_step_ratio = 0.5
+    assert sc_cfg.min_step_ratio == pytest.approx(0.5)
+    sc_cloned = copy.deepcopy(sc_cfg)
+    assert sc_cloned.min_step_ratio == pytest.approx(0.5)
+    for sc_eff in (sc_cfg, sc_cloned):
+        sc_eff.set_timesteps(sigmas=ltx_sigmas)
+        cur_50 = x_init.clone()
+        for i, t in enumerate(sc_eff.timesteps):
+            s_cur, s_nxt = float(sc_eff.sigmas[i].item()), float(sc_eff.sigmas[i + 1].item())
+            v = _perturbed_vel(cur_50, s_cur, i)
+            e_ref = cur_50 + (s_nxt - s_cur) * v
+            cur_50 = sc_eff.step(v, t, cur_50, return_dict=False)[0]
+            if i in (4, 5, 6):
+                assert (cur_50 - e_ref).abs().max().item() < 1e-6, f"setter/deepcopy 0.50 must fall back at step {i}"
+
+    # Exact equality boundary: sigmas=[1.0, 0.5, 0.25] has |c2| = ln(2)/ln(2) = 1.0 exactly at step 1!
+    # Strict `<` check: min_step_ratio=1.0 (int 1) keeps 2nd-order; min_step_ratio=1.0 + 1e-6 falls back to Euler.
+    sc_eq = FlowMatchResMultistepScheduler(min_step_ratio=1)  # also tests int acceptance!
+    assert sc_eq.min_step_ratio == pytest.approx(1.0)
+    sc_gt = FlowMatchResMultistepScheduler(min_step_ratio=1.0 + 1e-6)
+    for sc_b, expect_euler in ((sc_eq, False), (sc_gt, True)):
+        sc_b.set_timesteps(sigmas=[1.0, 0.5, 0.25])
+        xb = x_init.clone()
+        for i, t in enumerate(sc_b.timesteps):
+            s_cur, s_nxt = float(sc_b.sigmas[i].item()), float(sc_b.sigmas[i + 1].item())
+            v = _perturbed_vel(xb, s_cur, i)
+            e_ref = xb + (s_nxt - s_cur) * v
+            xb = sc_b.step(v, t, xb, return_dict=False)[0]
+            if i == 1:
+                diff_e = (xb - e_ref).abs().max().item()
+                if expect_euler:
+                    assert diff_e < 1e-6
+                else:
+                    assert diff_e > 1e-3
+
+    # int 0 accepted
+    assert FlowMatchResMultistepScheduler(min_step_ratio=0).min_step_ratio == pytest.approx(0.0)
+
+    for bad_ratio in (-0.01, -1.0, float("nan"), float("inf"), float("-inf"), True, False, "0.35", None):
+        with pytest.raises(ValueError, match="min_step_ratio"):
+            FlowMatchResMultistepScheduler(min_step_ratio=bad_ratio)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="min_step_ratio"):
+            sc_cfg.min_step_ratio = bad_ratio  # type: ignore[assignment]
 
 
 

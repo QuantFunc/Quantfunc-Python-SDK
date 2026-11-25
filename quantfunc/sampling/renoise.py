@@ -107,12 +107,24 @@ class FlowMatchRenoise:
             clean = self.tone_map(clean, self.tone_map_compression)
 
         if noise is None:
+            gen_device = (
+                generator.device
+                if isinstance(generator, torch.Generator)
+                else clean.device
+            )
+            sample_dtype = (
+                torch.float32
+                if (gen_device.type == "cpu" and clean.dtype == torch.float16)
+                else clean.dtype
+            )
             eps = torch.randn(
                 clean.shape,
                 generator=generator,
-                device=clean.device,
-                dtype=clean.dtype,
+                device=gen_device,
+                dtype=sample_dtype,
             )
+            if eps.device != clean.device or eps.dtype != clean.dtype:
+                eps = eps.to(device=clean.device, dtype=clean.dtype)
         else:
             if tuple(noise.shape) != tuple(clean.shape):
                 raise ValueError(

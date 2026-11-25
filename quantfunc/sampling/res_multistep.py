@@ -39,6 +39,7 @@ except ImportError:
 _DEGENERATE_EPS: float = 1e-12
 _SMALL_H_THRESHOLD: float = 1e-5
 _PER_TOKEN_LOWER_EPS: float = 1e-6
+_DEFAULT_MIN_STEP_RATIO: float = 0.35
 
 
 def _validate_sampler_mode(mode: Any) -> Literal["res_multistep", "euler"]:
@@ -47,6 +48,15 @@ def _validate_sampler_mode(mode: Any) -> Literal["res_multistep", "euler"]:
             f"Unsupported sampler_mode {mode!r}; expected one of {VALID_SAMPLERS}."
         )
     return mode  # type: ignore[return-value]
+
+
+def _validate_min_step_ratio(value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError(f"min_step_ratio must be a finite number >= 0, got {value!r}.")
+    val = float(value)
+    if not math.isfinite(val) or val < 0.0:
+        raise ValueError(f"min_step_ratio must be finite and >= 0, got {value!r}.")
+    return val
 
 
 def _phi1_phi2(neg_h: float) -> tuple[float, float]:
@@ -414,11 +424,14 @@ class FlowMatchResMultistepScheduler(_BaseScheduler):  # type: ignore[valid-type
         self,
         *args: Any,
         sampler_mode: Literal["res_multistep", "euler"] = "res_multistep",
+        min_step_ratio: float = _DEFAULT_MIN_STEP_RATIO,
         **kwargs: Any,
     ) -> None:
         validated_mode = _validate_sampler_mode(sampler_mode)
+        validated_min_step_ratio = _validate_min_step_ratio(min_step_ratio)
         super().__init__(*args, **kwargs)
         self._sampler_mode: Literal["res_multistep", "euler"] = validated_mode
+        self._min_step_ratio: float = validated_min_step_ratio
         self._old_denoised: torch.Tensor | None = None
         self._prev_sigma: float | None = None
 
@@ -431,6 +444,21 @@ class FlowMatchResMultistepScheduler(_BaseScheduler):  # type: ignore[valid-type
     def sampler_mode(self, value: Literal["res_multistep", "euler"]) -> None:
         self._sampler_mode = _validate_sampler_mode(value)
         self.reset_history()
+
+    @property
+    def min_step_ratio(self) -> float:
+        """Minimum log-SNR step ratio ``|c2|`` required for 2nd-order extrapolation.
+
+        When a discontinuous/stiff non-uniform sigma jump yields ``|c2| < min_step_ratio``
+        (e.g., distilled schedules where ``|b1| + |b2|`` would otherwise explode >10x),
+        that single step gracefully falls back to 1st-order Euler while smooth steps
+        continue using exact 2nd-order ``res_multistep``. Set ``0.0`` to disable.
+        """
+        return self._min_step_ratio
+
+    @min_step_ratio.setter
+    def min_step_ratio(self, value: float) -> None:
+        self._min_step_ratio = _validate_min_step_ratio(value)
 
     def reset_history(self) -> None:
         """Clear cached multistep history tensors and previous sigma."""
@@ -575,7 +603,8 @@ class FlowMatchResMultistepScheduler(_BaseScheduler):  # type: ignore[valid-type
                     x_next = x + (sigma_next - sigma) * v
                 else:
                     c2 = (t_prev - t) / h
-                    if abs(c2) < _DEGENERATE_EPS:
+                    c2_floor = max(_DEGENERATE_EPS, self._min_step_ratio)
+                    if abs(c2) < c2_floor:
                         x_next = x + (sigma_next - sigma) * v
                     else:
                         phi1, phi2 = _phi1_phi2(-h)
@@ -605,21 +634,29 @@ class FlowMatchResMultistepScheduler(_BaseScheduler):  # type: ignore[valid-type
 
 
 def _attach_base_init_signature() -> None:
-    """Expose base ``__init__`` parameters + ``sampler_mode`` for ``ConfigMixin.from_config``."""
+    """Expose base ``__init__`` parameters + QuantFunc kwargs for ``ConfigMixin.from_config``."""
     base_sig = inspect.signature(_BaseScheduler.__init__)
     params = list(base_sig.parameters.values())
-    if "sampler_mode" not in base_sig.parameters:
-        sampler_param = inspect.Parameter(
-            "sampler_mode",
-            inspect.Parameter.KEYWORD_ONLY,
-            default="res_multistep",
-        )
-        insert_at = len(params)
-        for idx, p in enumerate(params):
-            if p.kind == inspect.Parameter.VAR_KEYWORD:
-                insert_at = idx
-                break
-        params.insert(insert_at, sampler_param)
+    extra_params = [
+        ("sampler_mode", "res_multistep"),
+        ("min_step_ratio", _DEFAULT_MIN_STEP_RATIO),
+    ]
+    insert_at = len(params)
+    for idx, p in enumerate(params):
+        if p.kind == inspect.Parameter.VAR_KEYWORD:
+            insert_at = idx
+            break
+    for pname, pdefault in extra_params:
+        if pname not in base_sig.parameters:
+            params.insert(
+                insert_at,
+                inspect.Parameter(
+                    pname,
+                    inspect.Parameter.KEYWORD_ONLY,
+                    default=pdefault,
+                ),
+            )
+            insert_at += 1
     FlowMatchResMultistepScheduler.__init__.__signature__ = base_sig.replace(parameters=params)  # type: ignore[attr-defined]
 
 
