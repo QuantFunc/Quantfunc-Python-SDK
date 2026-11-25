@@ -1,0 +1,39 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+wheels/
+*.egg-info/
+*.egg
+
+# Test & linter caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Secrets & local runtime state (never commit user credentials or binaries)
+.env
+.env.*
+/config.json
+*.local.json
+
+# Native binaries & model weights
+*.so
+*.so.*
+*.dll
+*.dylib
+*.safetensors
+*.ckpt
+*.bin
+*.gguf

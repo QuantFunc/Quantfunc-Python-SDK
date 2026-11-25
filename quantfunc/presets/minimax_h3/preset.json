@@ -1,0 +1,37 @@
+{
+  "arch": "minimax_h3",
+  "display_name": "MiniMax-H3",
+  "modality": "audio_video",
+  "vae_scale_factors": [4, 16, 16],
+  "spatial_compression": 16,
+  "temporal_compression": 4,
+  "default_quality_ratio": 0.8,
+  "audio_latent_channels": 32,
+  "audio_mel_bins": 2,
+  "audio_stereo_channels": 2,
+  "default_video_sigma_shift": 12.0,
+  "default_audio_sigma_shift": 3.0,
+  "frame_grid": {
+    "base_frames": 5,
+    "frame_stride": 17,
+    "base_latent_t": 2,
+    "latent_t_stride": 5
+  },
+  "default_fps": 24.0,
+  "pipeline_classes": [
+    "MiniMaxH3ModularPipeline",
+    "MiniMaxH3Pipeline"
+  ],
+  "transformer_classes": [
+    "MiniMaxH3Transformer3DModel"
+  ],
+  "file_hints": [
+    "*minimax*h3*quantfunc*",
+    "*h3*quantfunc*int4*",
+    "*mmh3*quantfunc*"
+  ],
+  "tensor_hints": [
+    "token_refiner.",
+    "audio_patch_proj."
+  ]
+}

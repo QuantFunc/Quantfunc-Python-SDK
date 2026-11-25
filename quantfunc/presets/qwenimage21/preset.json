@@ -1,0 +1,30 @@
+{
+  "arch": "qwenimage21",
+  "display_name": "Qwen-Image-2.1",
+  "modality": "image",
+  "vae_scale_factors": [1, 16, 16],
+  "spatial_compression": 16,
+  "temporal_compression": 1,
+  "default_quality_ratio": 0.85,
+  "audio_latent_channels": 0,
+  "audio_mel_bins": 0,
+  "frame_grid": null,
+  "default_fps": null,
+  "pipeline_classes": [
+    "QwenImage21Pipeline",
+    "QwenImagePipeline",
+    "QwenImageEditPipeline"
+  ],
+  "transformer_classes": [
+    "QwenImage21Transformer2DModel"
+  ],
+  "file_hints": [
+    "*qwen-image-2.1*quantfunc*int4*",
+    "*qwen_image_2.1*quantfunc*int4*",
+    "*qwen-image-2.1*quantfunc*",
+    "*qwen_image_21*quantfunc*int4*"
+  ],
+  "tensor_hints": [
+    "txt_in.text_norm.weight"
+  ]
+}

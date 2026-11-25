@@ -1,0 +1,28 @@
+{
+  "arch": "krea2",
+  "display_name": "Krea-2",
+  "modality": "image",
+  "vae_scale_factors": [1, 8, 8],
+  "spatial_compression": 8,
+  "temporal_compression": 1,
+  "default_quality_ratio": 0.8,
+  "audio_latent_channels": 0,
+  "audio_mel_bins": 0,
+  "frame_grid": null,
+  "default_fps": null,
+  "pipeline_classes": [
+    "Krea2Pipeline"
+  ],
+  "transformer_classes": [
+    "Krea2Transformer2DModel"
+  ],
+  "file_hints": [
+    "*krea2*quantfunc*int4*",
+    "*krea*turbo*quantfunc*",
+    "*krea2*quantfunc*"
+  ],
+  "tensor_hints": [
+    "text_fusion.",
+    "txtfusion."
+  ]
+}

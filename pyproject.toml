@@ -1,0 +1,86 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quantfunc"
+version = "0.1.0"
+description = "Official Python SDK for the QuantFunc inference engine"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
+authors = [
+    {name = "QuantFunc Team"},
+]
+keywords = ["quantfunc", "diffusion", "diffusers", "inference", "video-generation", "image-generation"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.4",
+]
+
+[project.optional-dependencies]
+diffusers = [
+    "diffusers>=0.36.0",
+    "accelerate>=1.12.0",
+    "safetensors>=0.4.0",
+]
+transformers = [
+    "transformers>=4.48.0",
+]
+hf = [
+    "huggingface_hub>=0.25.0",
+]
+modelscope = [
+    "modelscope>=1.20.0",
+]
+all = [
+    "diffusers>=0.36.0",
+    "accelerate>=1.12.0",
+    "safetensors>=0.4.0",
+    "transformers>=4.48.0",
+    "huggingface_hub>=0.25.0",
+    "modelscope>=1.20.0",
+]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6.0",
+]
+
+[project.urls]
+Homepage = "https://www.quantfunc.com"
+Repository = "https://github.com/QuantFunc/Quantfunc-Python-SDK"
+Issues = "https://github.com/QuantFunc/Quantfunc-Python-SDK/issues"
+
+[project.scripts]
+quantfunc = "quantfunc.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["quantfunc*"]
+
+[tool.setuptools.package-data]
+quantfunc = ["presets/**/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501"]

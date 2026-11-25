@@ -1,0 +1,38 @@
+{
+  "arch": "ltx25",
+  "display_name": "LTX-2.5",
+  "modality": "audio_video",
+  "vae_scale_factors": [8, 32, 32],
+  "spatial_compression": 32,
+  "temporal_compression": 8,
+  "default_quality_ratio": 0.8,
+  "audio_latent_channels": 8,
+  "audio_mel_bins": 16,
+  "frame_grid": {
+    "base_frames": 1,
+    "frame_stride": 8,
+    "base_latent_t": 1,
+    "latent_t_stride": 1
+  },
+  "default_fps": 24.0,
+  "pipeline_classes": [
+    "LTX2Pipeline",
+    "LTX2ImageToVideoPipeline"
+  ],
+  "transformer_classes": [
+    "AVTransformer3DModel",
+    "LTX2VideoTransformer3DModel"
+  ],
+  "file_hints": [
+    "*ltx*2.5*quantfunc*4bit*",
+    "*ltx*2.5*quantfunc*int4*",
+    "*ltx25*quantfunc*",
+    "*ltx-2.5*transformer*int8*",
+    "*ltx-2.5*transformer*bf16*"
+  ],
+  "tensor_hints": [
+    "audio_to_video_attn.",
+    "video_embeddings_connector.",
+    "audio_attn1."
+  ]
+}
