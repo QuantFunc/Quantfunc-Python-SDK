@@ -57,6 +57,8 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "LoRAManager": ("quantfunc.core.lora", "LoRAManager"),
     "convert_lora_file": ("quantfunc.core.lora", "convert_lora_file"),
     "detect_lora_format": ("quantfunc.core.lora", "detect_lora_format"),
+    "UNSET": ("quantfunc.core.overrides", "UNSET"),
+    "RuntimeOverrides": ("quantfunc.core.overrides", "RuntimeOverrides"),
     "PresetMetadata": ("quantfunc.core.checkpoint", "PresetMetadata"),
     "resolve_checkpoint": ("quantfunc.core.checkpoint", "resolve_checkpoint"),
     "resolve_transformer_config": ("quantfunc.core.checkpoint", "resolve_transformer_config"),
@@ -85,6 +87,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "apply_cache_on_pipe": ("quantfunc.accelerate.hooks", "apply_cache_on_pipe"),
     "apply_sol_on_pipe": ("quantfunc.accelerate.hooks", "apply_sol_on_pipe"),
     "enable_offload": ("quantfunc.accelerate.hooks", "enable_offload"),
+    "request_scope": ("quantfunc.accelerate.serving", "request_scope"),
     # L3b: quantfunc.sampling
     "LatentBundle": ("quantfunc.sampling.bundle", "LatentBundle"),
     "split_sigmas": ("quantfunc.sampling.sigmas", "split_sigmas"),
@@ -113,6 +116,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
         "make_minimax_h3_two_stage_stages",
     ),
     "load_minimax_h3_pipeline": ("quantfunc.pipelines.minimax_h3", "load_minimax_h3_pipeline"),
+    "ServingPipeline": ("quantfunc.pipelines.serving", "ServingPipeline"),
 }
 
 _LAZY_SUBMODULES: frozenset[str] = frozenset(

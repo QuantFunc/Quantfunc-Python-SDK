@@ -48,6 +48,7 @@ _EXPECTED_EXAMPLES: tuple[str, ...] = (
     "minimax_h3_ref2va.py",
     "minimax_h3_ref2va_two_stage.py",
     "custom_multi_stage.py",
+    "12_http_fastapi_server.py",
 )
 
 # Numeric constants forbidden in arithmetic/shape geometry inside quantfunc/models/*.py
@@ -329,7 +330,15 @@ def test_clean_import_quantfunc_without_optional_deps() -> None:
     script = """
 import sys
 
-BLOCKED = ("diffusers", "transformers", "accelerate", "huggingface_hub", "modelscope")
+BLOCKED = (
+    "diffusers",
+    "transformers",
+    "accelerate",
+    "huggingface_hub",
+    "modelscope",
+    "fastapi",
+    "uvicorn",
+)
 for mod in BLOCKED:
     sys.modules[mod] = None
 
@@ -341,8 +350,10 @@ for mod in BLOCKED:
 
 sol = quantfunc.SolConfig(enabled=True, min_sequence_length=4096)
 assert sol.min_sequence_length == 4096
+ov = quantfunc.RuntimeOverrides.from_dict({"fbcache": 0.05, "sol": {"enabled": True, "tau": 1.3}})
+assert ov.block_cache == 0.05 and ov.sol.enabled is True and ov.quality_enhance is quantfunc.UNSET
 for mod in BLOCKED:
-    assert sys.modules.get(mod) is None, f"Optional dependency imported by L1 SolConfig: {mod}"
+    assert sys.modules.get(mod) is None, f"Optional dependency imported by L1 exports: {mod}"
 """
     env = dict(os.environ)
     env["CUDA_VISIBLE_DEVICES"] = ""
@@ -357,6 +368,112 @@ for mod in BLOCKED:
         check=False,
     )
     assert proc.returncode == 0, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+
+
+# ── Test 49: L1 overrides zero-torch, L3 no-cycle mutation & Example 12 hygiene ─
+
+
+def test_l1_overrides_zero_torch_l3_no_cycle_and_example12_hygiene(tmp_path: Path) -> None:
+    # (1) Pure-stdlib L1 RuntimeOverrides & SolConfig.from_dict with torch + all 7 optional deps blocked
+    script = """
+import sys
+
+BLOCKED = (
+    "diffusers",
+    "transformers",
+    "accelerate",
+    "huggingface_hub",
+    "modelscope",
+    "fastapi",
+    "uvicorn",
+    "torch",
+)
+for mod in BLOCKED:
+    sys.modules[mod] = None
+
+from quantfunc.core.overrides import RuntimeOverrides, UNSET
+from quantfunc.core.sol import SolConfig
+
+ov = RuntimeOverrides.from_dict(
+    {
+        "fbcache": 0.05,
+        "stepcache": 0.1,
+        "sol": {"enabled": True, "tau": 1.3, "min_tokens": 4096},
+        "loras": [{"name": "style", "scale": 0.8}],
+    }
+)
+assert ov.block_cache == 0.05
+assert ov.step_cache == 0.1
+assert isinstance(ov.sol, SolConfig) and ov.sol.enabled is True and ov.sol.min_sequence_length == 4096
+assert ov.quality_enhance is UNSET
+
+try:
+    RuntimeOverrides.from_dict({"fbcache": 0.05, "block_cache": 0.1})
+    raise SystemExit("MUST FAIL on conflicting aliases")
+except ValueError:
+    pass
+
+try:
+    RuntimeOverrides.from_dict({"unknown_dial": 1})
+    raise SystemExit("MUST FAIL on unknown key")
+except ValueError:
+    pass
+
+for mod in BLOCKED:
+    assert sys.modules.get(mod) is None, f"Blocked dependency imported by L1 core/overrides.py: {mod}"
+"""
+    env = dict(os.environ)
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    env["PYTHONPATH"] = str(REPO_ROOT) + (
+        os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+
+    # (2) Model-agnostic check on both L3a accelerate/serving.py and L4a pipelines/serving.py
+    for rel_path in ("quantfunc/accelerate/serving.py", "quantfunc/pipelines/serving.py"):
+        src = (REPO_ROOT / rel_path).read_text(encoding="utf-8")
+        tree = ast.parse(src, filename=rel_path)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name):
+                assert not _MODEL_NAME_PATTERN.search(node.id), f"Model name leak in {rel_path}: {node.id!r}"
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+                assert not _MODEL_NAME_PATTERN.search(node.value), f"Model name leak in {rel_path}: {node.value!r}"
+            elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+                assert not _MODEL_NAME_PATTERN.search(node.name), f"Model name leak in {rel_path}: {node.name!r}"
+
+    # Verify accelerate/serving.py NEVER imports quantfunc.sampling
+    acc_serving_src = (REPO_ROOT / "quantfunc" / "accelerate" / "serving.py").read_text(encoding="utf-8")
+    acc_tree = ast.parse(acc_serving_src, filename="quantfunc/accelerate/serving.py")
+    for node in ast.walk(acc_tree):
+        if isinstance(node, ast.Import | ast.ImportFrom):
+            for target in _resolve_import_target(node, "quantfunc.accelerate.serving"):
+                assert not target.startswith("quantfunc.sampling"), (
+                    f"Illegal L3a->L3b import in quantfunc/accelerate/serving.py: {target}"
+                )
+
+    # (3) Mutation arm: injecting accelerate -> sampling cycle into accelerate/serving.py MUST turn RED!
+    copy_root = tmp_path / "cycle_copy"
+    shutil.copytree(REPO_ROOT / "quantfunc", copy_root / "quantfunc")
+    assert check_layering_dag(copy_root) == []
+
+    serving_copy = copy_root / "quantfunc" / "accelerate" / "serving.py"
+    orig_serving = serving_copy.read_text(encoding="utf-8")
+    serving_copy.write_text(
+        orig_serving + "\ndef _bad_cycle():\n    from quantfunc.sampling.runner import MultiStageRunner\n    return MultiStageRunner\n",
+        encoding="utf-8",
+    )
+    cycle_errs = check_layering_dag(copy_root)
+    assert any("Subpackage import cycle detected" in e for e in cycle_errs), (
+        f"Expected subpackage import cycle detection, got {cycle_errs}"
+    )
+    serving_copy.write_text(orig_serving, encoding="utf-8")
 
 
 # ── Mutation Arm M6: Every static gate MUST turn RED on injected violation ──

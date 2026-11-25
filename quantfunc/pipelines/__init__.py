@@ -15,9 +15,11 @@ from quantfunc.pipelines.minimax_h3 import (
     reuse_h3_stage2_conditioning,
 )
 from quantfunc.pipelines.qwenimage21 import encode_qwen3_vl_pre_norm, load_qwenimage21_pipeline
+from quantfunc.pipelines.serving import ServingPipeline
 
 __all__ = [
     "LTX2NeuralLatentUpscaler",
+    "ServingPipeline",
     "encode_qwen3_vl_pre_norm",
     "ensure_deterministic_scheduler",
     "load_krea2_pipeline",

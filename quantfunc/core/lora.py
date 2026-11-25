@@ -11,8 +11,9 @@ import math
 import os
 import re
 import secrets
+import stat
 import struct
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -127,6 +128,56 @@ _DIFFUSERS_TE_RE = re.compile(r"text_encoder(_\d+)?\.")
 _PEFT_ADAPTER_RE = re.compile(r"(.+)\.(lora_A|lora_B|lora_down|lora_up)\.(?!weight$)[^.]+\.weight$")
 
 
+_LORA_ITEM_ALLOWED_KEYS: frozenset[str] = frozenset({"path", "name", "scale"})
+
+
+def _is_policy_unset(value: Any) -> bool:
+    return value is ... or type(value).__name__ == "_UnsetType"
+
+
+def _require_nonempty_path_str(value: Any, label: str) -> str:
+    if isinstance(value, os.PathLike):
+        raw = os.fspath(value)
+    elif isinstance(value, str):
+        raw = value
+    else:
+        raise ValueError(f"{label} must be a non-empty string or PathLike, got {type(value).__name__}")
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError(f"{label} must be a non-empty string, got {value!r}")
+    if "\x00" in raw:
+        raise ValueError(f"{label} must not contain NUL bytes")
+    return raw
+
+
+def _copy_lora_registry(
+    lora_registry: Mapping[str, str | os.PathLike[str]] | None,
+) -> dict[str, str] | None:
+    if lora_registry is None:
+        return None
+    if not isinstance(lora_registry, Mapping):
+        raise ValueError(f"lora_registry must be a mapping or None, got {type(lora_registry).__name__}")
+    out: dict[str, str] = {}
+    for k, v in lora_registry.items():
+        if not isinstance(k, str) or not k.strip() or "\x00" in k:
+            raise ValueError(f"lora_registry key must be a non-empty string without NUL bytes, got {k!r}")
+        out[k] = _require_nonempty_path_str(v, f"lora_registry[{k!r}]")
+    return out
+
+
+def _copy_allowed_roots(
+    allowed_lora_roots: Sequence[str | os.PathLike[str]] | None,
+) -> tuple[str, ...] | None:
+    if allowed_lora_roots is None:
+        return None
+    if isinstance(allowed_lora_roots, str | bytes | bytearray | os.PathLike) or not isinstance(
+        allowed_lora_roots, Sequence
+    ):
+        raise ValueError(
+            "allowed_lora_roots must be a sequence of directory paths (not a bare string or PathLike)"
+        )
+    return tuple(_require_nonempty_path_str(r, "allowed_lora_roots entry") for r in allowed_lora_roots)
+
+
 @dataclass(frozen=True)
 class LoRAEntry:
     """Single LoRA adapter specification."""
@@ -137,12 +188,122 @@ class LoRAEntry:
     def __post_init__(self) -> None:
         if not isinstance(self.path, str) or not self.path.strip():
             raise ValueError(f"LoRAEntry.path must be a non-empty string, got {self.path!r}")
+        if "\x00" in self.path:
+            raise ValueError("LoRAEntry.path must not contain NUL bytes")
         if isinstance(self.scale, bool) or not isinstance(self.scale, int | float):
             raise ValueError(f"LoRAEntry.scale must be a finite number, got {self.scale!r}")
         sc = float(self.scale)
         if not math.isfinite(sc):
             raise ValueError(f"LoRAEntry.scale must be finite, got {sc!r}")
+        if sc == 0.0:
+            sc = 0.0
         object.__setattr__(self, "scale", sc)
+
+
+def normalize_lora_entries(
+    entries: Sequence[
+        LoRAEntry
+        | tuple[str | os.PathLike[str], float]
+        | list[Any]
+        | Mapping[str, Any]
+        | str
+        | os.PathLike[str]
+    ]
+    | None,
+) -> list[LoRAEntry]:
+    """Normalize user/JSON LoRA specifications into a validated list of ``LoRAEntry`` items."""
+    if entries is None:
+        return []
+    if isinstance(entries, str | bytes | bytearray | Mapping) or not isinstance(entries, Sequence):
+        raise ValueError(
+            f"loras must be a sequence of LoRA specifications (not {type(entries).__name__}); pass [] to clear"
+        )
+    out: list[LoRAEntry] = []
+    for item in entries:
+        if isinstance(item, LoRAEntry):
+            out.append(item)
+        elif isinstance(item, str | os.PathLike):
+            path_str = _require_nonempty_path_str(item, "LoRA path")
+            out.append(LoRAEntry(path=path_str, scale=1.0))
+        elif isinstance(item, Mapping):
+            unknown: list[str] = []
+            for k in item:
+                if not isinstance(k, str):
+                    raise ValueError(f"LoRA entry mapping keys must be strings, got {type(k).__name__}")
+                if k not in _LORA_ITEM_ALLOWED_KEYS:
+                    unknown.append(k)
+            if unknown:
+                raise ValueError(f"Unknown LoRA entry key(s): {', '.join(sorted(unknown))}")
+            has_path = "path" in item
+            has_name = "name" in item
+            if not has_path and not has_name:
+                raise ValueError("LoRA entry mapping must specify 'path' or 'name'")
+            p_str = _require_nonempty_path_str(item["path"], "LoRA entry 'path'") if has_path else None
+            n_str = _require_nonempty_path_str(item["name"], "LoRA entry 'name'") if has_name else None
+            if p_str is not None and n_str is not None and p_str != n_str:
+                raise ValueError(
+                    f"Conflicting LoRA entry keys 'path' ({p_str!r}) and 'name' ({n_str!r})"
+                )
+            chosen = p_str if p_str is not None else n_str
+            assert chosen is not None
+            raw_scale = item["scale"] if "scale" in item else 1.0
+            out.append(LoRAEntry(path=chosen, scale=raw_scale))
+        elif isinstance(item, tuple | list):
+            if len(item) != 2:
+                raise ValueError(
+                    f"LoRA tuple/list entry must have length 2 (path, scale), got length {len(item)}"
+                )
+            path_str = _require_nonempty_path_str(item[0], "LoRA path")
+            out.append(LoRAEntry(path=path_str, scale=item[1]))
+        else:
+            raise ValueError(
+                f"Unsupported LoRA specification {item!r}; expected LoRAEntry, path, (path, scale), or mapping"
+            )
+    return out
+
+
+def resolve_lora_path(
+    raw: str | os.PathLike[str],
+    *,
+    lora_registry: Mapping[str, str | os.PathLike[str]] | None = None,
+    allowed_lora_roots: Sequence[str | os.PathLike[str]] | None = None,
+    strict_registry: bool = False,
+) -> str:
+    """Resolve a LoRA alias or path and enforce ``strict_registry`` / ``allowed_lora_roots`` BEFORE stat/open.
+
+    Executes containment via ``os.path.realpath`` + ``os.path.commonpath`` prior to any filesystem
+    existence checks, closing path-traversal, sibling-prefix, symlink-escape, and existence-oracle vectors.
+    """
+    raw_str = _require_nonempty_path_str(raw, "LoRA path")
+    if not isinstance(strict_registry, bool):
+        raise ValueError(f"strict_registry must be bool, got {strict_registry!r}")
+    reg = _copy_lora_registry(lora_registry)
+    roots = _copy_allowed_roots(allowed_lora_roots)
+
+    if reg is not None and raw_str in reg:
+        candidate = reg[raw_str]
+    else:
+        if strict_registry:
+            raise PermissionError(f"LoRA {raw_str!r} is not registered in lora_registry")
+        candidate = raw_str
+
+    real_path = os.path.realpath(os.path.expanduser(candidate))
+
+    if roots is not None:
+        matched = False
+        for r in roots:
+            root_real = os.path.realpath(os.path.expanduser(r))
+            try:
+                common = os.path.commonpath([root_real, real_path])
+            except ValueError:
+                continue
+            if real_path != root_real and common == root_real:
+                matched = True
+                break
+        if not matched:
+            raise PermissionError(f"LoRA path {raw_str!r} is outside allowed_lora_roots")
+
+    return real_path
 
 
 def _read_safetensors_header(path: str) -> dict[str, Any]:
@@ -516,7 +677,7 @@ def _needs_conversion(keys: Sequence[str], fmt: str) -> bool:
 
 
 class LoRAManager:
-    """Manages LoRA validation, cached auto-conversion, session teardown, and live hot-swap."""
+    """Manages LoRA policy enforcement, stat-cached O(1) no-op hot-swap, and auto-conversion."""
 
     def __init__(
         self,
@@ -524,7 +685,13 @@ class LoRAManager:
         *,
         cache_dir: str | os.PathLike[str] | None = None,
         model_path: str | os.PathLike[str] | None = None,
+        lora_registry: Mapping[str, str | os.PathLike[str]] | None = None,
+        allowed_lora_roots: Sequence[str | os.PathLike[str]] | None = None,
+        strict_registry: bool = False,
+        on_before_rebind: Callable[[], Any] | None = None,
     ) -> None:
+        if not isinstance(strict_registry, bool):
+            raise ValueError(f"strict_registry must be bool, got {strict_registry!r}")
         self._handle = handle
         self._cache_dir = (
             os.path.abspath(os.path.expanduser(os.fspath(cache_dir)))
@@ -532,7 +699,16 @@ class LoRAManager:
             else os.path.join(default_cache_dir(), "loras")
         )
         self._default_model_path = os.fspath(model_path) if model_path is not None else None
+        self._lora_registry: dict[str, str] | None = _copy_lora_registry(lora_registry)
+        self._allowed_lora_roots: tuple[str, ...] | None = _copy_allowed_roots(allowed_lora_roots)
+        self._strict_registry: bool = strict_registry
+        self._on_before_rebind: Callable[[], Any] | None = on_before_rebind
+
         self._active_loras: list[LoRAEntry] = []
+        self._bound_stack_sig: tuple[tuple[str, int, int, int, float], ...] | None = ()
+        self._bound_model_sig: str = ""
+        self._bound_prepared_sig: str = "[]"
+        self._prepared_cache: dict[tuple[str, int, int, int, str], str] = {}
 
     @property
     def cache_dir(self) -> str:
@@ -542,26 +718,71 @@ class LoRAManager:
     def active_loras(self) -> tuple[LoRAEntry, ...]:
         return tuple(self._active_loras)
 
+    @property
+    def lora_registry(self) -> dict[str, str] | None:
+        return dict(self._lora_registry) if self._lora_registry is not None else None
+
+    @property
+    def allowed_lora_roots(self) -> tuple[str, ...] | None:
+        return self._allowed_lora_roots
+
+    @property
+    def strict_registry(self) -> bool:
+        return self._strict_registry
+
+    def configure_policy(
+        self,
+        *,
+        lora_registry: Any = ...,
+        allowed_lora_roots: Any = ...,
+        strict_registry: Any = ...,
+    ) -> None:
+        """Atomically update default alias registry, allowed roots, and strict registry mode."""
+        new_reg = self._lora_registry if _is_policy_unset(lora_registry) else _copy_lora_registry(lora_registry)
+        new_roots = (
+            self._allowed_lora_roots
+            if _is_policy_unset(allowed_lora_roots)
+            else _copy_allowed_roots(allowed_lora_roots)
+        )
+        if _is_policy_unset(strict_registry):
+            new_strict = self._strict_registry
+        else:
+            if not isinstance(strict_registry, bool):
+                raise ValueError(f"strict_registry must be bool, got {strict_registry!r}")
+            new_strict = strict_registry
+
+        self._lora_registry = new_reg
+        self._allowed_lora_roots = new_roots
+        self._strict_registry = new_strict
+
+    def _invoke_before_rebind(self) -> None:
+        if self._on_before_rebind is not None:
+            self._on_before_rebind()
+        else:
+            self._handle.end_session_if_open()
+
     def _normalize_entries(
         self,
-        entries: Sequence[LoRAEntry | tuple[str | os.PathLike[str], float] | str | os.PathLike[str]],
+        entries: Sequence[
+            LoRAEntry
+            | tuple[str | os.PathLike[str], float]
+            | list[Any]
+            | Mapping[str, Any]
+            | str
+            | os.PathLike[str]
+        ],
     ) -> list[LoRAEntry]:
-        out: list[LoRAEntry] = []
-        for item in entries:
-            if isinstance(item, LoRAEntry):
-                out.append(item)
-            elif isinstance(item, str | os.PathLike):
-                out.append(LoRAEntry(path=os.fspath(item), scale=1.0))
-            elif isinstance(item, tuple) and len(item) == 2:
-                out.append(LoRAEntry(path=os.fspath(item[0]), scale=float(item[1])))
-            else:
-                raise TypeError(f"Unsupported LoRA specification: {item!r}")
-        return out
+        return normalize_lora_entries(entries)
 
-    def _prepare_path(self, raw_path: str, *, model_path: str | None = None) -> str:
-        abs_path = os.path.realpath(os.path.expanduser(raw_path))
-        if not os.path.isfile(abs_path):
-            raise FileNotFoundError(f"LoRA file not found: {raw_path!r}")
+    def _prepare_resolved_path(
+        self,
+        abs_path: str,
+        *,
+        raw_label: str,
+        st: os.stat_result,
+        model_path: str | None = None,
+        force: bool = False,
+    ) -> str:
         hdr = _read_safetensors_header(abs_path)
         meta = hdr.get("__metadata__", {})
         keys = [k for k in hdr if k != "__metadata__"]
@@ -573,44 +794,141 @@ class LoRAManager:
 
         fmt = detect_lora_format(keys)
         if fmt == "unknown":
-            raise ValueError(f"Could not detect LoRA format in {raw_path!r}")
+            raise ValueError(f"Could not detect LoRA format in {raw_label!r}")
 
         if not _needs_conversion(keys, fmt):
             conv, bfl = _convert_keys(keys, fmt)
             why = _check_refusal(conv, meta if isinstance(meta, dict) else {}, bfl)
             if why is not None:
-                raise ValueError(f"Refusing LoRA {raw_path!r}: {why}")
+                raise ValueError(f"Refusing LoRA {raw_label!r}: {why}")
             return abs_path
 
-        st = os.stat(abs_path)
         eff_model = os.path.realpath(model_path) if model_path else ""
         cache_key = hashlib.sha256(
-            f"{abs_path}|{st.st_size}|{st.st_mtime_ns}|{eff_model}".encode()
+            f"{abs_path}|{st.st_size}|{st.st_mtime_ns}|{st.st_ino}|{eff_model}".encode()
         ).hexdigest()[:24]
         os.makedirs(self._cache_dir, exist_ok=True)
         cached_path = os.path.join(self._cache_dir, f"{cache_key}.safetensors")
-        if os.path.isfile(cached_path):
+        if not force and os.path.isfile(cached_path):
             return cached_path
         return convert_lora_file(abs_path, cached_path, model_path=eff_model or None)
 
+    def _prepare_path(self, raw_path: str, *, model_path: str | None = None) -> str:
+        real_path = resolve_lora_path(
+            raw_path,
+            lora_registry=self._lora_registry,
+            allowed_lora_roots=self._allowed_lora_roots,
+            strict_registry=self._strict_registry,
+        )
+        try:
+            st = os.stat(real_path)
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(f"LoRA file not found: {raw_path!r}") from exc
+        if not stat.S_ISREG(st.st_mode):
+            raise FileNotFoundError(f"LoRA file not found: {raw_path!r}")
+        return self._prepare_resolved_path(real_path, raw_label=raw_path, st=st, model_path=model_path)
+
     def set_loras(
         self,
-        entries: Sequence[LoRAEntry | tuple[str | os.PathLike[str], float] | str | os.PathLike[str]],
+        entries: Sequence[
+            LoRAEntry
+            | tuple[str | os.PathLike[str], float]
+            | list[Any]
+            | Mapping[str, Any]
+            | str
+            | os.PathLike[str]
+        ],
         *,
         model_path: str | os.PathLike[str] | None = None,
+        lora_registry: Mapping[str, str | os.PathLike[str]] | None = None,
+        allowed_lora_roots: Sequence[str | os.PathLike[str]] | None = None,
+        strict_registry: bool | None = None,
+        force: bool = False,
     ) -> list[LoRAEntry]:
-        """Validate/convert entries, close any active session, and apply via ``qf_xfm_set_loras``."""
-        normalized = self._normalize_entries(entries)
-        eff_model = os.fspath(model_path) if model_path is not None else self._default_model_path
+        """Validate/convert entries with O(1) stat-cached no-op and apply via ``qf_xfm_set_loras``."""
+        normalized = normalize_lora_entries(entries)
+        if not normalized:
+            self.unload_loras(force=force)
+            return []
+
+        eff_registry = self._lora_registry if lora_registry is None else _copy_lora_registry(lora_registry)
+        eff_roots = (
+            self._allowed_lora_roots if allowed_lora_roots is None else _copy_allowed_roots(allowed_lora_roots)
+        )
+        if strict_registry is None:
+            eff_strict = self._strict_registry
+        else:
+            if not isinstance(strict_registry, bool):
+                raise ValueError(f"strict_registry must be bool, got {strict_registry!r}")
+            eff_strict = strict_registry
+
+        eff_model_raw = os.fspath(model_path) if model_path is not None else self._default_model_path
+        eff_model_real = os.path.realpath(os.path.expanduser(eff_model_raw)) if eff_model_raw else ""
+
+        resolved_items: list[tuple[LoRAEntry, str, os.stat_result]] = []
+        sig_parts: list[tuple[str, int, int, int, float]] = []
+        for entry in normalized:
+            real_path = resolve_lora_path(
+                entry.path,
+                lora_registry=eff_registry,
+                allowed_lora_roots=eff_roots,
+                strict_registry=eff_strict,
+            )
+            try:
+                st = os.stat(real_path)
+            except FileNotFoundError as exc:
+                raise FileNotFoundError(f"LoRA file not found: {entry.path!r}") from exc
+            if not stat.S_ISREG(st.st_mode):
+                raise FileNotFoundError(f"LoRA path is not a regular file: {entry.path!r}")
+            resolved_items.append((entry, real_path, st))
+            sig_parts.append((real_path, st.st_mtime_ns, st.st_size, st.st_ino, float(entry.scale)))
+
+        candidate_sig = tuple(sig_parts)
+        handle_sig = getattr(self._handle, "applied_lora_sig", self._bound_prepared_sig)
+        if (
+            not force
+            and self._bound_stack_sig is not None
+            and candidate_sig == self._bound_stack_sig
+            and eff_model_real == self._bound_model_sig
+            and handle_sig == self._bound_prepared_sig
+        ):
+            return list(self._active_loras)
 
         prepared: list[dict[str, Any]] = []
-        for entry in normalized:
-            ready_path = self._prepare_path(entry.path, model_path=eff_model)
+        for entry, real_path, st in resolved_items:
+            file_key = (real_path, st.st_mtime_ns, st.st_size, st.st_ino, eff_model_real)
+            cached_ready = None if force else self._prepared_cache.get(file_key)
+            if cached_ready is not None and os.path.isfile(cached_ready):
+                ready_path = cached_ready
+            else:
+                ready_path = self._prepare_resolved_path(
+                    real_path,
+                    raw_label=entry.path,
+                    st=st,
+                    model_path=eff_model_real or None,
+                    force=force,
+                )
+                # Evict stale stat snapshots for the same (real_path, model_sig)
+                stale_keys = [
+                    k for k in self._prepared_cache if k[0] == real_path and k[4] == eff_model_real and k != file_key
+                ]
+                for sk in stale_keys:
+                    self._prepared_cache.pop(sk, None)
+                self._prepared_cache[file_key] = ready_path
             prepared.append({"path": ready_path, "scale": float(entry.scale)})
 
-        self._handle.end_session_if_open()
-        self._handle.set_loras(prepared)
+        self._invoke_before_rebind()
+        prepared_sig = json.dumps(prepared, allow_nan=False, separators=(",", ":"))
+        try:
+            self._handle.set_loras(prepared)
+        except BaseException:
+            self._bound_stack_sig = None
+            raise
+
         self._active_loras = list(normalized)
+        self._bound_stack_sig = candidate_sig
+        self._bound_model_sig = eff_model_real
+        self._bound_prepared_sig = getattr(self._handle, "applied_lora_sig", prepared_sig)
         return list(self._active_loras)
 
     def load_lora(
@@ -619,19 +937,43 @@ class LoRAManager:
         scale: float = 1.0,
         *,
         model_path: str | os.PathLike[str] | None = None,
+        lora_registry: Mapping[str, str | os.PathLike[str]] | None = None,
+        allowed_lora_roots: Sequence[str | os.PathLike[str]] | None = None,
+        strict_registry: bool | None = None,
+        force: bool = False,
     ) -> list[LoRAEntry]:
         """Hot-load a single LoRA adapter."""
-        return self.set_loras([LoRAEntry(path=os.fspath(path), scale=float(scale))], model_path=model_path)
+        path_str = _require_nonempty_path_str(path, "LoRA path")
+        return self.set_loras(
+            [LoRAEntry(path=path_str, scale=scale)],
+            model_path=model_path,
+            lora_registry=lora_registry,
+            allowed_lora_roots=allowed_lora_roots,
+            strict_registry=strict_registry,
+            force=force,
+        )
 
-    def unload_loras(self) -> None:
-        """Close any active session and clear active LoRAs by sending ``[]`` to ``qf_xfm_set_loras``."""
-        self._handle.end_session_if_open()
-        self._handle.set_loras([])
+    def unload_loras(self, *, force: bool = False) -> None:
+        """Close any active session and clear active LoRAs by sending ``[]`` (O(1) no-op when already empty)."""
+        handle_sig = getattr(self._handle, "applied_lora_sig", "[]")
+        if not force and self._bound_stack_sig == () and handle_sig == "[]":
+            return
+        self._invoke_before_rebind()
+        try:
+            self._handle.set_loras([])
+        except BaseException:
+            self._bound_stack_sig = None
+            raise
         self._active_loras = []
+        self._bound_stack_sig = ()
+        self._bound_model_sig = ""
+        self._bound_prepared_sig = getattr(self._handle, "applied_lora_sig", "[]")
 
 
 __all__ = [
     "LoRAEntry",
+    "normalize_lora_entries",
+    "resolve_lora_path",
     "detect_lora_format",
     "unsupported_lora_kind",
     "convert_lora_file",

@@ -136,10 +136,10 @@ L0: quantfunc.native                           Frozen C-API bindings, secure ins
 | Layer | Package | Responsibility |
 |---|---|---|
 | **L0** | `quantfunc.native` | 25-symbol C-API, typed error hierarchy, HTTPS/SHA-256 installer & updater, RAII engine handle |
-| **L1** | `quantfunc.core` | Model-agnostic `SolConfig`, `EngineConfig`, `AutoSessionTracker`, pure-stdlib LoRA converter, preset metadata, `@register_model` |
-| **L2** | `quantfunc.models` | `QuantFuncBaseTransformer` (meta/offload safe) and Krea-2, Qwen-Image-2.1, LTX-2.5, MiniMax-H3 adapters |
-| **L3** | `quantfunc.accelerate`, `quantfunc.sampling` | Instance-level scheduler hooks (`pipe.__class__` untouched), cache/Sol/offload helpers, generic `MultiStageRunner` |
-| **L4** | `quantfunc.pipelines`, `quantfunc.cli` | Model-specific pipeline loaders, two-stage factories, Qwen3-VL pre-norm helper, `quantfunc` CLI |
+| **L1** | `quantfunc.core` | Model-agnostic `SolConfig`, `EngineConfig`, `RuntimeOverrides`, `AutoSessionTracker`, pure-stdlib LoRA converter & O(1) cache, preset metadata, `@register_model` |
+| **L2** | `quantfunc.models` | `QuantFuncBaseTransformer` (meta/offload safe, per-request state reset) and Krea-2, Qwen-Image-2.1, LTX-2.5, MiniMax-H3 adapters |
+| **L3** | `quantfunc.accelerate`, `quantfunc.sampling` | Instance-level scheduler hooks (`pipe.__class__` untouched), `request_scope` serving lock & override engine, generic `MultiStageRunner` |
+| **L4** | `quantfunc.pipelines`, `quantfunc.cli` | Model-specific pipeline loaders, two-stage factories, model-agnostic `ServingPipeline`, Qwen3-VL pre-norm helper, `quantfunc` CLI |
 
 ---
 
@@ -207,6 +207,62 @@ runner = MultiStageRunner([
 result = runner.run(pipe, prompt="a botanical greenhouse at golden hour")
 ```
 
+### Online HTTP Serving & Per-Request Parameter Switching
+
+Keep a single warm pipeline resident in GPU memory and switch prompts, multimodal conditions (`image`, `video`, `audio`, `mask`, `ref_audio`, `av_conditions`, `ref_latents`, `image_slots`), acceleration dials (`sol`, `loras`, `quality_enhance`, `fbcache`/`block_cache`, `stepcache`/`step_cache`, `attention_backend`, `default_steps`), and single-stage vs multi-stage workflows per request with zero base-weight reloads:
+
+```python
+from quantfunc import ServingPipeline
+
+server = ServingPipeline(
+    pipe,
+    lora_registry={"style": "/srv/loras/style.safetensors"},
+    allowed_lora_roots=["/srv/loras"],
+    sticky_loras=True,   # O(1) zero-overhead LoRA reuse across consecutive identical requests
+    busy_timeout=30.0,   # raises EngineBusyError when overloaded instead of corrupting state
+)
+
+# Request 1: single-stage with LoRA alias, block cache, Sol, and quality_enhance
+out1 = server.generate(
+    "alpine sunrise over misty peaks",
+    overrides={
+        "loras": [{"name": "style", "scale": 0.8}],
+        "fbcache": 0.05,
+        "sol": {"enabled": True, "tau": 1.3},
+        "quality_enhance": True,
+        "attention_backend": "int8",
+    },
+    width=1024,
+    height=1024,
+    num_inference_steps=8,
+)
+
+# Request 2: same LoRA stack hits O(1) cache (zero header reads / zero native rebind) + switches to two-stage
+out2 = server.generate(
+    "ocean waves at dusk",
+    overrides={"loras": [{"name": "style", "scale": 0.8}]},
+    stages=two_stage_specs,
+)
+
+# Request 3: omitting loras resets to default_loras (empty by default, preventing cross-request leakage)
+out3 = server.generate("minimal desert dunes", overrides={"sol": None})
+
+# Async serving & non-blocking health/status inspection (never exposes host root directories)
+out4 = await server.agenerate("starry observatory")
+snapshot = server.status()
+server.close()
+```
+
+For lower-level control around an existing `diffusers` call, use `with request_scope(pipe, overrides, ...):`.
+
+**Deployment model**: run one worker process per GPU with a single warm `ServingPipeline` instance (concurrent threads and `asyncio` tasks are safely serialized by the built-in per-pipeline reentrant lock). Scale across multiple GPUs horizontally by launching one worker process per `CUDA_VISIBLE_DEVICES` device.
+
+Run the pure-CPU HTTP serving self-test (works with or without optional `fastapi`/`uvicorn`):
+
+```bash
+python3 examples/12_http_fastapi_server.py --self-test
+```
+
 ### CLI Reference
 
 | Command | Purpose |
@@ -222,7 +278,7 @@ result = runner.run(pipe, prompt="a botanical greenhouse at golden hour")
 
 ## Examples
 
-All 11 runnable example scripts live under [`examples/`](examples/) and read credentials from `QUANTFUNC_API_KEY` or `~/.config/quantfunc/config.json`:
+All 12 runnable example scripts live under [`examples/`](examples/) and read credentials from `QUANTFUNC_API_KEY` or `~/.config/quantfunc/config.json`:
 
 | Example | Workflow & Features |
 |---|---|
@@ -237,6 +293,7 @@ All 11 runnable example scripts live under [`examples/`](examples/) and read cre
 | [`examples/minimax_h3_ref2va.py`](examples/minimax_h3_ref2va.py) | MiniMax-H3 multimodal reference audio-video generation (Ref2VA) |
 | [`examples/minimax_h3_ref2va_two_stage.py`](examples/minimax_h3_ref2va_two_stage.py) | MiniMax-H3 Ref2VA two-stage high-resolution refinement |
 | [`examples/custom_multi_stage.py`](examples/custom_multi_stage.py) | Custom 3-stage workflow (`draft -> mid -> high-res refine`) with a custom `LatentUpscaler` and per-stage overrides |
+| [`examples/12_http_fastapi_server.py`](examples/12_http_fastapi_server.py) | Online HTTP / FastAPI server (with stdlib fallback & pure-CPU `--self-test`) demonstrating per-request dial/LoRA/stage switching and LFI/SSRF protection |
 
 ---
 

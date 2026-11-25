@@ -827,3 +827,594 @@ def test_real_diffusers_schedulers_e2e_krea2(tmp_path: Path) -> None:
             assert [s["step_index"] for s in lib_mut.steps] == [0, 1, 2, 3, 4, 5, 6]
     finally:
         xfm_mut.close()
+
+
+# ── Rev 4 Helpers & Tests 43-45 (request_scope, runner dedup, Mutation M9) ──
+
+
+def _make_dummy_lora_safetensors(path: Path, val: float = 1.0) -> Path:
+    raw = struct.pack("<4f", val, val + 1.0, val + 2.0, val + 3.0)
+    header = json.dumps(
+        {
+            "transformer_blocks.0.attn.to_q.lora_A.weight": {
+                "dtype": "F32",
+                "shape": [2, 2],
+                "data_offsets": [0, len(raw)],
+            },
+            "transformer_blocks.0.attn.to_q.lora_B.weight": {
+                "dtype": "F32",
+                "shape": [2, 2],
+                "data_offsets": [0, len(raw)],
+            },
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as fh:
+        fh.write(struct.pack("<Q", len(header)))
+        fh.write(header)
+        fh.write(raw)
+    return path
+
+
+def _make_dummy_ckpt_with_keys(path: Path, keys: list[str]) -> Path:
+    raw = struct.pack("<2f", 1.0, 2.0)
+    hdr_dict = {
+        k: {"dtype": "F32", "shape": [1, 2], "data_offsets": [0, len(raw)]}
+        for k in keys
+    }
+    header = json.dumps(hdr_dict, separators=(",", ":")).encode("utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as fh:
+        fh.write(struct.pack("<Q", len(header)))
+        fh.write(header)
+        fh.write(raw)
+    return path
+
+
+# ── Test 43: request_scope sticky/non-sticky LoRAs, dials & conditions ──────
+
+
+def test_request_scope_sticky_loras_dials_and_conditions(tmp_path: Path) -> None:
+    from quantfunc.accelerate.serving import (
+        get_pipeline_lock,
+        request_scope,
+    )
+    from quantfunc.core.overrides import RuntimeOverrides
+    from quantfunc.models.ltx25 import QuantFuncLTX25Transformer3DModel
+    from quantfunc.models.minimax_h3 import QuantFuncMiniMaxH3Transformer3DModel
+    from quantfunc.native.errors import EngineBusyError, UnsupportedError
+
+    lora_a = _make_dummy_lora_safetensors(tmp_path / "lora_a.safetensors", val=1.0)
+    lora_b = _make_dummy_lora_safetensors(tmp_path / "lora_b.safetensors", val=2.0)
+    ckpt = _make_dummy_krea2_ckpt(tmp_path / "krea2-r4-scope.safetensors")
+
+    lib = FakeQFLib()
+    xfm = QuantFuncKrea2Transformer2DModel.from_pretrained(ckpt, lib=lib, torch_dtype=torch.float32)
+    pipe = SimpleNamespace(transformer=xfm, scheduler=_PostIncScheduler())
+
+    try:
+        # (1) sticky_loras=True: Req1 [A:0.8] -> Req2 [A:0.8] (0 extra binds) -> Req3 [] -> Req4 default_loras=() (0 extra binds)
+        with request_scope(pipe, {"loras": [(str(lora_a), 0.8)]}, sticky_loras=True):
+            assert len(lib.loras_history) == 1
+            assert len(xfm.active_loras) == 1 and xfm.active_loras[0].scale == pytest.approx(0.8)
+        # Still bound after exit because sticky_loras=True
+        assert len(xfm.active_loras) == 1
+
+        with request_scope(pipe, {"loras": [(str(lora_a), 0.8)]}, sticky_loras=True):
+            assert len(lib.loras_history) == 1  # O(1) hit: 0 extra qf_xfm_set_loras!
+
+        with request_scope(pipe, {"loras": []}, sticky_loras=True):
+            assert len(lib.loras_history) == 2
+            assert lib.loras_history[-1] == []
+            assert xfm.active_loras == []
+
+        with request_scope(pipe, {}, sticky_loras=True, default_loras=()):
+            assert len(lib.loras_history) == 2  # Already empty -> O(1) no-op!
+            assert xfm.active_loras == []
+
+        # (2) sticky_loras=False restores LoRAs on normal exit AND exception exit
+        xfm.set_loras([(str(lora_a), 0.5)])
+        binds_base = len(lib.loras_history)
+        with request_scope(pipe, {"loras": [(str(lora_b), 0.9)]}, sticky_loras=False):
+            assert len(xfm.active_loras) == 1 and xfm.active_loras[0].scale == pytest.approx(0.9)
+            assert len(lib.loras_history) == binds_base + 1
+        assert len(xfm.active_loras) == 1 and xfm.active_loras[0].scale == pytest.approx(0.5)
+
+        with pytest.raises(RuntimeError, match="scope_err"):
+            with request_scope(pipe, {"loras": [(str(lora_b), 0.9)]}, sticky_loras=False):
+                assert xfm.active_loras[0].scale == pytest.approx(0.9)
+                raise RuntimeError("scope_err")
+        assert len(xfm.active_loras) == 1 and xfm.active_loras[0].scale == pytest.approx(0.5)
+
+        # (3) All runtime dials (incl. sol=None disabling default Sol AND sol=SolConfig when baseline None)
+        base_sol = SolConfig(enabled=True, tau=1.2, start_percent=0.0, end_percent=0.9)
+        xfm.set_quality_enhance(False)
+        xfm.set_cache(block_cache=0.02, step_cache=0.03)
+        xfm.set_sol(base_sol)
+        xfm.set_attention_backend("auto")
+        xfm.set_default_steps(12)
+
+        with request_scope(
+            pipe,
+            {
+                "quality_enhance": True,
+                "fbcache": 0.08,
+                "stepcache": 0.15,
+                "sol": None,
+                "attention_backend": "int8",
+                "default_steps": 6,
+            },
+        ):
+            assert xfm.quality_enhance is True
+            assert xfm.block_cache == pytest.approx(0.08)
+            assert xfm.step_cache == pytest.approx(0.15)
+            assert xfm.sol_config is None
+            assert xfm.attention_backend == "int8"
+            assert xfm._default_steps == 6
+
+        # 100% restored on normal exit
+        assert xfm.quality_enhance is False
+        assert xfm.block_cache == pytest.approx(0.02)
+        assert xfm.step_cache == pytest.approx(0.03)
+        assert xfm.sol_config == base_sol
+        assert xfm.attention_backend == "auto"
+        assert xfm._default_steps == 12
+
+        # Baseline sol=None overridden with SolConfig restores cleanly back to None on exception!
+        xfm.set_sol(None)
+        x_in = torch.randn(1, 64, 2, 2, dtype=torch.float32)
+        ctx = torch.randn(1, 4, 2560, dtype=torch.float32)
+        with pytest.raises(RuntimeError, match="mid_step_boom"):
+            with request_scope(
+                pipe,
+                RuntimeOverrides.from_dict(
+                    {
+                        "quality_enhance": True,
+                        "fbcache": 0.09,
+                        "sol": {"enabled": True, "tau": 1.35},
+                        "attention_backend": "fp16",
+                        "default_steps": 4,
+                    }
+                ),
+            ):
+                assert xfm.sol_config is not None and xfm.sol_config.enabled is True
+                xfm(x_in, encoder_hidden_states=ctx, timestep=0.5)
+                assert xfm._session_is_open() is True
+                raise RuntimeError("mid_step_boom")
+
+        assert xfm._session_is_open() is False
+        assert xfm.quality_enhance is False
+        assert xfm.block_cache == pytest.approx(0.02)
+        assert xfm.sol_config is None
+        assert xfm.attention_backend == "auto"
+        assert xfm._default_steps == 12
+        # Lock must be released after exception
+        lock = get_pipeline_lock(pipe)
+        assert lock.acquire(blocking=False) is True
+        lock.release()
+
+        # (4) Unsupported ref_audio / av_conditions on image-only Krea-2 -> UnsupportedError (None is no-op)
+        with request_scope(pipe, {}, ref_audio=None, av_conditions=None):
+            pass
+        with pytest.raises(UnsupportedError):
+            with request_scope(pipe, {}, ref_audio=torch.ones(1, 4, 128)):
+                pass
+        with pytest.raises(UnsupportedError):
+            with request_scope(pipe, {}, av_conditions={"keyframes": []}):
+                pass
+
+        # Pre-lock validation: illegal av_conditions key & invalid overrides raise ValueError BEFORE acquiring lock!
+        held = threading.Event()
+        release = threading.Event()
+
+        def _hold_lock() -> None:
+            with lock:
+                held.set()
+                release.wait(timeout=5.0)
+
+        holder = threading.Thread(target=_hold_lock)
+        holder.start()
+        assert held.wait(timeout=2.0)
+        try:
+            with pytest.raises(ValueError, match="Unknown av_conditions"):
+                with request_scope(pipe, {}, busy_timeout=0.0, av_conditions={"bad_key": 1}):
+                    pass
+            with pytest.raises(ValueError, match="Unknown RuntimeOverrides"):
+                with request_scope(pipe, {"unknown_dial": 1}, busy_timeout=0.0):
+                    pass
+            # Control: valid input with busy_timeout=0.0 raises EngineBusyError while held
+            with pytest.raises(EngineBusyError):
+                with request_scope(pipe, {}, busy_timeout=0.0):
+                    pass
+        finally:
+            release.set()
+            holder.join(timeout=5.0)
+    finally:
+        xfm.close()
+
+    # (5) LTX-2.5 ref_audio injection & guaranteed finally cleanup (normal + exception)
+    lib_ltx = FakeQFLib()
+    ckpt_ltx = _make_dummy_ckpt_with_keys(
+        tmp_path / "ltx25-scope.safetensors",
+        [
+            "model.diffusion_model.video_embeddings_connector.w",
+            "model.diffusion_model.audio_embeddings_connector.w",
+        ],
+    )
+    xfm_ltx = QuantFuncLTX25Transformer3DModel.from_pretrained(ckpt_ltx, lib=lib_ltx, torch_dtype=torch.float32)
+    pipe_ltx = SimpleNamespace(transformer=xfm_ltx, scheduler=_PostIncScheduler())
+    try:
+        ref_a = torch.randn(1, 4, 128, dtype=torch.float32)
+        with request_scope(pipe_ltx, {}, ref_audio=ref_a):
+            assert xfm_ltx._ref_audio_state is not None
+        assert xfm_ltx._ref_audio_state is None
+
+        with pytest.raises(RuntimeError, match="ltx_boom"):
+            with request_scope(pipe_ltx, {}, ref_audio=ref_a):
+                assert xfm_ltx._ref_audio_state is not None
+                raise RuntimeError("ltx_boom")
+        assert xfm_ltx._ref_audio_state is None
+    finally:
+        xfm_ltx.close()
+
+    # (6) MiniMax-H3 av_conditions injection & guaranteed finally cleanup (normal + exception)
+    lib_h3 = FakeQFLib()
+    ckpt_h3 = _make_dummy_ckpt_with_keys(tmp_path / "minimax-h3-scope.safetensors", ["blocks.0.w"])
+    xfm_h3 = QuantFuncMiniMaxH3Transformer3DModel.from_pretrained(ckpt_h3, lib=lib_h3, torch_dtype=torch.float32)
+    pipe_h3 = SimpleNamespace(transformer=xfm_h3, scheduler=_PostIncScheduler())
+    try:
+        kf = [{"latent": torch.randn(1, 24, 1, 4, 4, dtype=torch.float32), "frame_index": 0}]
+        with request_scope(pipe_h3, {}, av_conditions={"keyframes": kf}):
+            assert xfm_h3._av_conditions is not None
+        assert xfm_h3._av_conditions is None
+        assert xfm_h3._av_cond_device_cache == {}
+
+        with pytest.raises(RuntimeError, match="h3_boom"):
+            with request_scope(pipe_h3, {}, av_conditions={"keyframes": kf}):
+                assert xfm_h3._av_conditions is not None
+                raise RuntimeError("h3_boom")
+        assert xfm_h3._av_conditions is None
+        assert xfm_h3._av_cond_device_cache == {}
+    finally:
+        xfm_h3.close()
+
+
+# ── Test 44: request_scope concurrency, busy_timeout & MultiStageRunner dedup ──
+
+
+def test_request_scope_concurrency_busy_timeout_and_runner_dedup(tmp_path: Path) -> None:
+    from quantfunc.accelerate.serving import (
+        apply_runtime_overrides,
+        request_scope,
+        restore_runtime_overrides,
+    )
+    from quantfunc.core.overrides import RuntimeOverrides
+    from quantfunc.native.errors import EngineBusyError, UnsupportedError
+
+    pipe = _StubPipe(scheduler=_PostIncScheduler(), with_free_hooks=False)
+    pipe.transformer.set_quality_enhance(False)
+    pipe.transformer.set_cache(block_cache=0.01, step_cache=0.02)
+
+    # Invalid busy_timeout rejected before lock
+    for bad_t in (-0.1, True, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="busy_timeout"):
+            with request_scope(pipe, {}, busy_timeout=bad_t):  # type: ignore[arg-type]
+                pass
+
+    # Concurrency serialization & busy_timeout
+    t1_entered = threading.Event()
+    t1_release = threading.Event()
+    t1_observed: dict[str, Any] = {}
+    t2_errors: list[BaseException] = []
+    t3_observed: dict[str, Any] = {}
+
+    def _thread1() -> None:
+        with request_scope(pipe, {"quality_enhance": True, "fbcache": 0.07}):
+            t1_entered.set()
+            assert t1_release.wait(timeout=5.0)
+            # Thread 2's rejected call must NOT have mutated Thread 1's active dials!
+            t1_observed["qe"] = pipe.transformer.quality_enhance
+            t1_observed["bc"] = pipe.transformer.block_cache
+
+    def _thread2() -> None:
+        try:
+            with request_scope(pipe, {"quality_enhance": False, "fbcache": 0.0}, busy_timeout=0.02):
+                pass
+        except BaseException as exc:
+            t2_errors.append(exc)
+
+    def _thread3() -> None:
+        with request_scope(pipe, {"stepcache": 0.11}, busy_timeout=2.0):
+            # Must see restored baseline quality_enhance=False & block_cache=0.01
+            t3_observed["qe"] = pipe.transformer.quality_enhance
+            t3_observed["bc"] = pipe.transformer.block_cache
+            t3_observed["sc"] = pipe.transformer.step_cache
+
+    th1 = threading.Thread(target=_thread1)
+    th1.start()
+    assert t1_entered.wait(timeout=2.0)
+
+    th2 = threading.Thread(target=_thread2)
+    th2.start()
+    th2.join(timeout=2.0)
+    assert len(t2_errors) == 1 and isinstance(t2_errors[0], EngineBusyError)
+
+    # Start Thread 3 waiting on lock before releasing Thread 1
+    th3 = threading.Thread(target=_thread3)
+    th3.start()
+    t1_release.set()
+    th1.join(timeout=5.0)
+    th3.join(timeout=5.0)
+
+    assert t1_observed == {"qe": True, "bc": pytest.approx(0.07)}
+    assert t3_observed == {"qe": False, "bc": pytest.approx(0.01), "sc": pytest.approx(0.11)}
+    assert pipe.transformer.step_cache == pytest.approx(0.02)
+
+    # Same-thread nested request_scope (RLock) does not deadlock and nests cleanly
+    with request_scope(pipe, {"quality_enhance": True, "fbcache": 0.05}):
+        assert pipe.transformer.quality_enhance is True
+        with request_scope(pipe, {"quality_enhance": False, "fbcache": 0.09}, busy_timeout=0.0):
+            assert pipe.transformer.quality_enhance is False
+            assert pipe.transformer.block_cache == pytest.approx(0.09)
+        assert pipe.transformer.quality_enhance is True
+        assert pipe.transformer.block_cache == pytest.approx(0.05)
+    assert pipe.transformer.quality_enhance is False
+    assert pipe.transformer.block_cache == pytest.approx(0.01)
+
+    # Deduplicated MultiStageRunner with RuntimeOverrides, fbcache/stepcache aliases & sol dict
+    stage_seen: list[dict[str, Any]] = []
+
+    class _RunPipe(_StubPipe):
+        def __call__(self, **kw: Any) -> Any:
+            stage_seen.append(
+                {
+                    "bc": self.transformer.block_cache,
+                    "sc": self.transformer.step_cache,
+                    "sol": self.transformer.sol_config,
+                    "loras": list(self.transformer.active_loras),
+                }
+            )
+            return SimpleNamespace(images=torch.ones(1, 4, 8, 8))
+
+    rpipe = _RunPipe(scheduler=_PostIncScheduler(), with_free_hooks=False)
+    rpipe.transformer.set_cache(block_cache=0.01, step_cache=0.01)
+    rpipe.transformer.set_sol(None)
+
+    stages = [
+        StageSpec(
+            name="s1",
+            num_inference_steps=2,
+            output_type="latent",
+            transformer_overrides=RuntimeOverrides(block_cache=0.06),
+        ),
+        StageSpec(
+            name="s2",
+            num_inference_steps=2,
+            output_type="pil",
+            transformer_overrides={
+                "fbcache": 0.07,
+                "stepcache": 0.12,
+                "sol": {"enabled": True, "tau": 1.2},
+                "loras": [("mid.safetensors", 0.5)],
+            },
+        ),
+    ]
+    MultiStageRunner(stages).run(rpipe, prompt="test")
+    assert stage_seen[0]["bc"] == pytest.approx(0.06)
+    assert stage_seen[1]["bc"] == pytest.approx(0.07)
+    assert stage_seen[1]["sc"] == pytest.approx(0.12)
+    assert isinstance(stage_seen[1]["sol"], SolConfig) and stage_seen[1]["sol"].enabled is True
+    # Duck-typed _StubTransformer preserves raw tuple list!
+    assert stage_seen[1]["loras"] == [("mid.safetensors", 0.5)]
+    # All restored after stages
+    assert rpipe.transformer.block_cache == pytest.approx(0.01)
+    assert rpipe.transformer.step_cache == pytest.approx(0.01)
+    assert rpipe.transformer.sol_config is None
+    assert rpipe.transformer.active_loras == []
+
+    # Duck-typed _StubTransformer MUST fail closed with UnsupportedError when explicit security policy passed
+    for bad_policy_kw in (
+        {"allowed_lora_roots": [str(tmp_path)]},
+        {"lora_registry": {"style": str(tmp_path / "a.safetensors")}},
+        {"strict_lora_registry": True},
+    ):
+        with pytest.raises(UnsupportedError):
+            apply_runtime_overrides(
+                rpipe,
+                {"loras": [("x.safetensors", 0.5)]},
+                allow_extra_attrs=True,
+                **bad_policy_kw,
+            )
+
+    # Real QuantFuncBaseTransformer configured with strict_registry=True MUST NOT be downgraded by strict_lora_registry=None
+    lora_ok = _make_dummy_lora_safetensors(tmp_path / "ok.safetensors", val=1.0)
+    lora_unreg = _make_dummy_lora_safetensors(tmp_path / "unreg.safetensors", val=2.0)
+    ckpt = _make_dummy_krea2_ckpt(tmp_path / "krea2-strict-inherit.safetensors")
+    lib = FakeQFLib()
+    xfm = QuantFuncKrea2Transformer2DModel.from_pretrained(ckpt, lib=lib, torch_dtype=torch.float32)
+    try:
+        xfm.configure_lora_policy(lora_registry={"ok": str(lora_ok)}, strict_registry=True)
+        qpipe = SimpleNamespace(transformer=xfm, scheduler=_PostIncScheduler())
+        with pytest.raises(PermissionError):
+            apply_runtime_overrides(
+                qpipe,
+                {"loras": [str(lora_unreg)]},
+                allow_extra_attrs=True,
+                strict_lora_registry=None,
+            )
+        saved = apply_runtime_overrides(
+            qpipe,
+            {"loras": [("ok", 0.6)]},
+            allow_extra_attrs=True,
+            strict_lora_registry=None,
+        )
+        assert len(xfm.active_loras) == 1
+        restore_runtime_overrides(saved)
+        assert xfm.active_loras == []
+    finally:
+        xfm.close()
+
+
+# ── Test 45 / Mutation Arm M9: request_scope invariants ─────────────────────
+
+
+def test_mutation_m9_request_scope_invariants(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import quantfunc.accelerate.serving as serving_mod
+    from quantfunc.native.errors import EngineBusyError
+
+    # M9(a): Removing lock acquisition (no-op lock) MUST break concurrent busy_timeout=0 -> EngineBusyError
+    pipe_a = _StubPipe(scheduler=_PostIncScheduler(), with_free_hooks=False)
+
+    class _NoOpLock:
+        def acquire(self, blocking: bool = True, timeout: float = -1.0) -> bool:
+            _ = (blocking, timeout)
+            return True
+
+        def release(self) -> None:
+            pass
+
+    def _run_concurrent_busy_check(pipe_obj: Any, lock_override: Any | None) -> bool:
+        entered = threading.Event()
+        release = threading.Event()
+        got_busy = False
+
+        def _holder() -> None:
+            with serving_mod.request_scope(pipe_obj, {}, lock=lock_override):
+                entered.set()
+                release.wait(timeout=5.0)
+
+        t = threading.Thread(target=_holder)
+        t.start()
+        assert entered.wait(timeout=2.0)
+        try:
+            with serving_mod.request_scope(pipe_obj, {}, lock=lock_override, busy_timeout=0.0):
+                pass
+        except EngineBusyError:
+            got_busy = True
+        finally:
+            release.set()
+            t.join(timeout=5.0)
+        return got_busy
+
+    # Mutated (unlocked) fails the concurrency invariant
+    with pytest.raises(AssertionError):
+        assert _run_concurrent_busy_check(pipe_a, _NoOpLock()) is True
+    # Control (real lock) passes
+    assert _run_concurrent_busy_check(pipe_a, None) is True
+
+    # M9(b): Skipping reset_request_state() or restore_runtime_overrides() in finally MUST fail post-exception check
+    lib_h3 = FakeQFLib()
+    ckpt_h3 = _make_dummy_ckpt_with_keys(tmp_path / "h3-m9b.safetensors", ["blocks.0.w"])
+    from quantfunc.models.minimax_h3 import QuantFuncMiniMaxH3Transformer3DModel
+
+    xfm_h3 = QuantFuncMiniMaxH3Transformer3DModel.from_pretrained(ckpt_h3, lib=lib_h3, torch_dtype=torch.float32)
+    pipe_b = SimpleNamespace(transformer=xfm_h3, scheduler=_PostIncScheduler())
+    kf = [{"latent": torch.randn(1, 24, 1, 4, 4, dtype=torch.float32), "frame_index": 0}]
+    try:
+        # Mutate reset_request_state to no-op
+        with monkeypatch.context() as mp:
+            mp.setattr(serving_mod, "_reset_transformer_request_state", lambda _t: None)
+            with pytest.raises(RuntimeError, match="m9b"):
+                with serving_mod.request_scope(pipe_b, {"quality_enhance": True}, av_conditions={"keyframes": kf}):
+                    raise RuntimeError("m9b")
+            with pytest.raises(AssertionError):
+                assert xfm_h3._av_conditions is None
+        xfm_h3.clear_av_conditions()
+
+        # Mutate restore_runtime_overrides to no-op
+        with monkeypatch.context() as mp:
+            mp.setattr(serving_mod, "restore_runtime_overrides", lambda _saved: None)
+            with pytest.raises(RuntimeError, match="m9b2"):
+                with serving_mod.request_scope(pipe_b, {"quality_enhance": True}):
+                    raise RuntimeError("m9b2")
+            with pytest.raises(AssertionError):
+                assert xfm_h3.quality_enhance is False
+        xfm_h3.set_quality_enhance(False)
+
+        # Green control: both cleaned up after exception
+        with pytest.raises(RuntimeError, match="m9b_ok"):
+            with serving_mod.request_scope(pipe_b, {"quality_enhance": True}, av_conditions={"keyframes": kf}):
+                raise RuntimeError("m9b_ok")
+        assert xfm_h3._av_conditions is None
+        assert xfm_h3.quality_enhance is False
+    finally:
+        xfm_h3.close()
+
+    # M9(c): Breaking sol=None restore branch MUST fail SolConfig restoration assertion
+    pipe_c = _StubPipe(scheduler=_PostIncScheduler(), with_free_hooks=False)
+    base_sol = SolConfig(enabled=True, tau=1.3, start_percent=0.0, end_percent=0.9)
+    pipe_c.transformer.set_sol(None)
+
+    def _broken_restore_ignores_none(saved_records: list[tuple[Any, list[tuple[str, Any]]]]) -> None:
+        for transformer, saved in reversed(saved_records):
+            for key, prev in reversed(saved):
+                if key == "sol" and prev is not None:  # MUTATION: skips restoring None!
+                    transformer.set_sol(prev)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(serving_mod, "restore_runtime_overrides", _broken_restore_ignores_none)
+        with serving_mod.request_scope(pipe_c, {"sol": base_sol}):
+            assert pipe_c.transformer.sol_config == base_sol
+        with pytest.raises(AssertionError):
+            assert pipe_c.transformer.sol_config is None
+
+    # Green control: sol=None baseline restored AND sol=base_sol restored after explicit sol=None override
+    pipe_c.transformer.set_sol(None)
+    with serving_mod.request_scope(pipe_c, {"sol": base_sol}):
+        assert pipe_c.transformer.sol_config == base_sol
+    assert pipe_c.transformer.sol_config is None
+
+    pipe_c.transformer.set_sol(base_sol)
+    with serving_mod.request_scope(pipe_c, {"sol": None}):
+        assert pipe_c.transformer.sol_config is None
+    assert pipe_c.transformer.sol_config == base_sol
+
+
+def test_apply_runtime_overrides_multi_transformer_atomic_rollback_sticky_loras(tmp_path: Path) -> None:
+    """Mid-apply failure on a second transformer must atomically roll back transformer 1 (incl. sticky LoRAs)."""
+    from quantfunc.accelerate.serving import apply_runtime_overrides
+    from quantfunc.core.overrides import RuntimeOverrides
+
+    lora_a = _make_dummy_lora_safetensors(tmp_path / "rb_a.safetensors", val=1.0)
+    ckpt1 = _make_dummy_krea2_ckpt(tmp_path / "krea_rb1.safetensors")
+    ckpt2 = _make_dummy_krea2_ckpt(tmp_path / "krea_rb2.safetensors")
+    t1 = QuantFuncKrea2Transformer2DModel.from_pretrained(ckpt1, lib=FakeQFLib(), torch_dtype=torch.float32)
+    t2 = QuantFuncKrea2Transformer2DModel.from_pretrained(ckpt2, lib=FakeQFLib(), torch_dtype=torch.float32)
+    pipe = SimpleNamespace(transformer=t1, transformer_2=t2)
+    try:
+        orig_set_loras = t2.set_loras
+
+        def _boom_loras(*_a: Any, **_kw: Any) -> None:
+            raise RuntimeError("t2_lora_bind_failed")
+
+        t2.set_loras = _boom_loras  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError, match="t2_lora_bind_failed"):
+            apply_runtime_overrides(
+                pipe,
+                RuntimeOverrides.from_dict(
+                    {
+                        "quality_enhance": True,
+                        "fbcache": 0.08,
+                        "sol": {"enabled": True, "tau": 1.3},
+                        "loras": [(str(lora_a), 0.75)],
+                    }
+                ),
+                sticky_loras=True,
+            )
+
+        # Transformer 1 must be completely rolled back (including sticky LoRAs and all dials)
+        assert t1.quality_enhance is False
+        assert t1.block_cache == pytest.approx(0.0)
+        assert t1.sol_config is None
+        assert t1.active_loras == []
+        # Transformer 2 dials mutated before set_loras must also be rolled back
+        assert t2.quality_enhance is False
+        assert t2.block_cache == pytest.approx(0.0)
+        assert t2.sol_config is None
+        t2.set_loras = orig_set_loras  # type: ignore[method-assign]
+    finally:
+        t1.close()
+        t2.close()
+
+

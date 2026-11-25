@@ -3,18 +3,23 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
 import torch
 
-from quantfunc.accelerate.hooks import discover_transformers, pipe_session
+from quantfunc.accelerate.hooks import pipe_session
+from quantfunc.accelerate.serving import (
+    apply_runtime_overrides,
+    restore_runtime_overrides,
+    snapshot_cache,
+    snapshot_loras,
+)
+from quantfunc.core.overrides import RuntimeOverrides
 from quantfunc.sampling.bundle import LatentBundle
 from quantfunc.sampling.sigmas import build_linear_sigmas
 from quantfunc.sampling.upscalers import LatentUpscaler
-
-_MISSING = object()
 
 
 @dataclass
@@ -34,7 +39,7 @@ class StageSpec:
     renoise: Callable[..., Any] | None = None
     latent_extractor: Callable[[Any, StageSpec], LatentBundle] | None = None
     stage_call_adapter: Callable[[Any, StageSpec, LatentBundle | None, dict[str, Any]], Any] | None = None
-    transformer_overrides: dict[str, Any] | None = None
+    transformer_overrides: RuntimeOverrides | Mapping[str, Any] | None = None
     conditioning_callback: Callable[
         [Any, StageSpec, LatentBundle | None, dict[str, Any]], dict[str, Any] | None
     ] | None = None
@@ -84,171 +89,27 @@ def _default_extract_bundle(output: Any) -> LatentBundle:
     return LatentBundle(video_or_image=output, audio=audio)
 
 
-def _snapshot_cache(transformer: Any) -> tuple[float | None, float | None]:
-    cache_cfg = getattr(transformer, "_cache_config", None) or getattr(transformer, "cache_config", None)
-    if cache_cfg is not None:
-        return (
-            getattr(cache_cfg, "step_cache", None),
-            getattr(cache_cfg, "block_cache", None),
-        )
-    return (
-        getattr(transformer, "step_cache", None),
-        getattr(transformer, "block_cache", None),
-    )
-
-
-def _snapshot_loras(transformer: Any) -> list[Any]:
-    lora_mgr = getattr(transformer, "_lora_manager", None)
-    if lora_mgr is not None and hasattr(lora_mgr, "active_loras"):
-        return list(lora_mgr.active_loras)
-    if hasattr(transformer, "active_loras"):
-        return list(transformer.active_loras)
-    if hasattr(transformer, "_loras"):
-        return list(transformer._loras)
-    if hasattr(transformer, "loras"):
-        return list(transformer.loras)
-    return []
+_snapshot_cache = snapshot_cache
+_snapshot_loras = snapshot_loras
 
 
 def _apply_transformer_overrides(
     pipe: Any,
-    overrides: dict[str, Any] | None,
+    overrides: RuntimeOverrides | Mapping[str, Any] | None,
 ) -> list[tuple[Any, list[tuple[str, Any]]]]:
-    if not overrides:
-        return []
-    transformers = discover_transformers(pipe)
-    if not transformers:
-        return []
-
-    saved_records: list[tuple[Any, list[tuple[str, Any]]]] = []
-    for transformer in transformers:
-        saved: list[tuple[str, Any]] = []
-        cache_saved = False
-        try:
-            for key, value in overrides.items():
-                if key == "quality_enhance":
-                    prev = getattr(transformer, "quality_enhance", None)
-                    if prev is None and hasattr(transformer, "_quality_config"):
-                        prev = getattr(transformer._quality_config, "quality_enhance", False)
-                    saved.append(("quality_enhance", prev))
-                    if callable(getattr(transformer, "set_quality_enhance", None)):
-                        transformer.set_quality_enhance(bool(value))
-                    else:
-                        transformer.quality_enhance = bool(value)
-                elif key in ("block_cache", "step_cache"):
-                    if not cache_saved:
-                        saved.append(("__cache__", _snapshot_cache(transformer)))
-                        cache_saved = True
-                    if callable(getattr(transformer, "set_cache", None)):
-                        transformer.set_cache(**{key: value})
-                    else:
-                        setattr(transformer, key, value)
-                elif key == "sol":
-                    prev_sol = getattr(transformer, "sol_config", None)
-                    if prev_sol is None:
-                        prev_sol = getattr(transformer, "_sol_config", None)
-                    saved.append(("sol", prev_sol))
-                    if callable(getattr(transformer, "set_sol", None)):
-                        transformer.set_sol(value)
-                    else:
-                        transformer.sol_config = value
-                elif key == "attention_backend":
-                    prev_ab = getattr(transformer, "attention_backend", None)
-                    if prev_ab is None and hasattr(transformer, "_engine_config"):
-                        prev_ab = getattr(transformer._engine_config, "attention_backend", None)
-                    saved.append(("attention_backend", prev_ab))
-                    if callable(getattr(transformer, "set_attention_backend", None)):
-                        transformer.set_attention_backend(value)
-                    else:
-                        transformer.attention_backend = value
-                elif key == "loras":
-                    saved.append(("loras", _snapshot_loras(transformer)))
-                    if not value and callable(getattr(transformer, "unload_loras", None)):
-                        transformer.unload_loras()
-                    elif callable(getattr(transformer, "set_loras", None)):
-                        transformer.set_loras(value)
-                    else:
-                        transformer.loras = list(value)
-                elif key == "default_steps":
-                    prev_ds = getattr(transformer, "_default_steps", None)
-                    saved.append(("default_steps", prev_ds))
-                    if callable(getattr(transformer, "set_default_steps", None)):
-                        transformer.set_default_steps(value)
-                    else:
-                        transformer._default_steps = value
-                else:
-                    prev_attr = getattr(transformer, key, _MISSING)
-                    saved.append((f"attr:{key}", prev_attr))
-                    setattr(transformer, key, value)
-        except BaseException:
-            saved_records.append((transformer, saved))
-            _restore_transformer_overrides(saved_records)
-            raise
-        saved_records.append((transformer, saved))
-    return saved_records
+    return apply_runtime_overrides(
+        pipe,
+        overrides,
+        sticky_loras=False,
+        allow_extra_attrs=True,
+        strict_lora_registry=None,
+    )
 
 
 def _restore_transformer_overrides(
     saved_records: list[tuple[Any, list[tuple[str, Any]]]],
 ) -> None:
-    first_error: BaseException | None = None
-    for transformer, saved in reversed(saved_records):
-        for key, prev in reversed(saved):
-            try:
-                if key == "quality_enhance":
-                    if callable(getattr(transformer, "set_quality_enhance", None)):
-                        transformer.set_quality_enhance(bool(prev))
-                    else:
-                        transformer.quality_enhance = bool(prev)
-                elif key == "__cache__":
-                    prev_step, prev_block = prev
-                    if callable(getattr(transformer, "set_cache", None)):
-                        kwargs: dict[str, Any] = {}
-                        if prev_step is not None:
-                            kwargs["step_cache"] = prev_step
-                        if prev_block is not None:
-                            kwargs["block_cache"] = prev_block
-                        if kwargs:
-                            transformer.set_cache(**kwargs)
-                    else:
-                        if prev_step is not None:
-                            transformer.step_cache = prev_step
-                        if prev_block is not None:
-                            transformer.block_cache = prev_block
-                elif key == "sol":
-                    if callable(getattr(transformer, "set_sol", None)) and prev is not None:
-                        transformer.set_sol(prev)
-                    else:
-                        transformer.sol_config = prev
-                elif key == "attention_backend":
-                    if callable(getattr(transformer, "set_attention_backend", None)) and prev is not None:
-                        transformer.set_attention_backend(prev)
-                    else:
-                        transformer.attention_backend = prev
-                elif key == "loras":
-                    if not prev and callable(getattr(transformer, "unload_loras", None)):
-                        transformer.unload_loras()
-                    elif callable(getattr(transformer, "set_loras", None)):
-                        transformer.set_loras(prev)
-                    else:
-                        transformer.loras = list(prev)
-                elif key == "default_steps":
-                    if callable(getattr(transformer, "set_default_steps", None)) and prev is not None:
-                        transformer.set_default_steps(prev)
-                    else:
-                        transformer._default_steps = prev
-                elif key.startswith("attr:"):
-                    attr_name = key[5:]
-                    if prev is _MISSING:
-                        if hasattr(transformer, "__dict__"):
-                            transformer.__dict__.pop(attr_name, None)
-                    else:
-                        setattr(transformer, attr_name, prev)
-            except BaseException as exc:  # pragma: no cover - preserve first restore error
-                if first_error is None:
-                    first_error = exc
-    if first_error is not None:
-        raise first_error
+    restore_runtime_overrides(saved_records)
 
 
 class MultiStageRunner:

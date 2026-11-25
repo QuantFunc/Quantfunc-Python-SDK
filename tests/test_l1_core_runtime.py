@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import stat
 import struct
+import subprocess
+import sys
 import warnings
 from pathlib import Path
 from typing import Any
@@ -13,8 +16,8 @@ from typing import Any
 import pytest
 from conftest import FakeQFLib
 
-from quantfunc.core import checkpoint, config, lora, registry, session, sol
-from quantfunc.native.capi import QF_DTYPE_BF16
+from quantfunc.core import checkpoint, config, lora, overrides, registry, session, sol
+from quantfunc.native.capi import QF_DTYPE_BF16, QF_ERR_INTERNAL
 from quantfunc.native.handle import QFEngineHandle
 
 
@@ -689,3 +692,603 @@ def test_mutation_l1_rules(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
             assert mut_indices == [0, 1, 2, 3, 4, 5, 6]
     finally:
         mut_eng.destroy()
+
+
+# ── Test 36: SolConfig.from_dict / to_dict 18-field roundtrip & strict validation ──
+
+
+def test_sol_from_dict_roundtrip_and_strict_validation() -> None:
+    cfg = sol.SolConfig(
+        enabled=True,
+        tau=1.25,
+        selector="meansim",
+        window_enabled=True,
+        start_percent=0.15,
+        end_percent=0.85,
+        sigma_start=0.9,
+        sigma_end=0.1,
+        min_sequence_length=8192,
+        sink_conditioning="exact_kv",
+        first_layers_dense=2,
+        first_steps_dense=1,
+        first_steps_dense_frac=0.25,
+        plan_interval=3,
+        auto_dense_guard=True,
+        require_permute=False,
+        top_p=0.92,
+        cdf=0.96,
+    )
+    as_dict = cfg.to_dict()
+    assert len(as_dict) == 18
+    assert sol.SolConfig.from_dict(as_dict) == cfg
+    assert sol.SolConfig.from_dict(json.loads(json.dumps(as_dict))) == cfg
+    assert sol.SolConfig.from_dict({}) == sol.SolConfig()
+
+    # Wire alias min_tokens -> min_sequence_length (alone or matching canonical)
+    via_alias = sol.SolConfig.from_dict({"enabled": True, "min_tokens": 4096})
+    assert via_alias.enabled is True
+    assert via_alias.min_sequence_length == 4096
+    matching = sol.SolConfig.from_dict({"min_tokens": 4096, "min_sequence_length": 4096})
+    assert matching.min_sequence_length == 4096
+
+    # Fail-closed refusals
+    for bad in (
+        {"min_tokens": 4096, "min_sequence_length": 8192},
+        {"min_tokens": True},
+        {"min_tokens": True, "min_sequence_length": 1},
+        {"enabled": True, "foo": 1},
+        {1: "bad_key"},
+        {"enabled": True, "tau": float("nan")},
+        {"enabled": True, "tau": float("inf")},
+        {"enabled": True, "start_percent": 0.9, "end_percent": 0.2},
+        {"enabled": True, "sigma_start": 0.8},
+    ):
+        with pytest.raises(ValueError):
+            sol.SolConfig.from_dict(bad)  # type: ignore[arg-type]
+
+    for non_mapping in (None, [("enabled", True)], "invalid", 42):
+        with pytest.raises(ValueError):
+            sol.SolConfig.from_dict(non_mapping)  # type: ignore[arg-type]
+
+
+# ── Test 37: RuntimeOverrides pure-stdlib, UNSET vs None, aliases & refusals ──
+
+
+def test_runtime_overrides_aliases_unset_and_refusals() -> None:
+    # Pure-stdlib / zero-torch verification in isolated subprocess
+    repo_root = Path(__file__).resolve().parent.parent
+    probe = """
+import sys
+for mod in ("diffusers", "transformers", "accelerate", "huggingface_hub", "modelscope", "fastapi", "uvicorn", "torch"):
+    sys.modules[mod] = None
+from quantfunc.core.overrides import RuntimeOverrides, UNSET
+from quantfunc.core.sol import SolConfig
+ov = RuntimeOverrides.from_dict({
+    "fbcache": 0.05,
+    "stepcache": 0.1,
+    "sol": {"enabled": True, "min_tokens": 4096},
+    "loras": [{"name": "style", "scale": 0.8}],
+})
+assert ov.block_cache == 0.05 and ov.step_cache == 0.1
+assert isinstance(ov.sol, SolConfig) and ov.sol.min_sequence_length == 4096
+assert ov.quality_enhance is UNSET
+"""
+    env = dict(os.environ)
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    env["PYTHONPATH"] = str(repo_root) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    proc = subprocess.run([sys.executable, "-c", probe], env=env, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+
+    # UNSET sentinel invariants
+    assert bool(overrides.UNSET) is False
+    assert repr(overrides.UNSET) == "UNSET"
+    assert overrides.UNSET is not None
+    assert copy.copy(overrides.UNSET) is overrides.UNSET
+    assert copy.deepcopy(overrides.UNSET) is overrides.UNSET
+    assert type(overrides.UNSET)() is overrides.UNSET
+
+    # Empty & from_any behavior
+    empty = overrides.RuntimeOverrides.from_dict({})
+    assert empty.is_empty() is True
+    assert empty.to_dict() == {}
+    assert empty.sol is overrides.UNSET
+    assert empty.loras is overrides.UNSET
+    assert overrides.RuntimeOverrides.from_any(None) == empty
+    assert overrides.RuntimeOverrides.from_any(overrides.UNSET) == empty  # type: ignore[arg-type]
+    assert overrides.RuntimeOverrides.from_any(empty) is empty
+
+    # Explicit sol=None vs UNSET; explicit loras=[] vs UNSET
+    sol_off = overrides.RuntimeOverrides.from_dict({"sol": None})
+    assert sol_off.sol is None
+    assert sol_off.sol is not overrides.UNSET
+    assert sol_off.is_empty() is False
+    assert sol_off.to_dict() == {"sol": None}
+    assert overrides.RuntimeOverrides.from_dict(sol_off.to_dict()) == sol_off
+
+    clear_loras = overrides.RuntimeOverrides.from_dict({"loras": []})
+    assert clear_loras.loras == ()
+    assert clear_loras.to_dict() == {"loras": []}
+
+    # Aliases (fbcache/stepcache, matching canonical, attention aliases, LoRA formats)
+    full = overrides.RuntimeOverrides.from_dict(
+        {
+            "quality_enhance": True,
+            "fbcache": 0.05,
+            "block_cache": 0.05,
+            "stepcache": 0.12,
+            "step_cache": 0.12,
+            "sol": {"enabled": True, "tau": 1.3, "min_tokens": 2048},
+            "attention_backend": "int4_pv8",
+            "loras": [
+                "a.safetensors",
+                ["b.safetensors", 0.75],
+                ("c.safetensors", -0.25),
+                {"name": "style_alias", "scale": 0.6},
+                {"path": "same", "name": "same", "scale": 1.0},
+            ],
+            "default_steps": 24,
+        }
+    )
+    assert full.quality_enhance is True
+    assert full.block_cache == pytest.approx(0.05)
+    assert full.step_cache == pytest.approx(0.12)
+    assert isinstance(full.sol, sol.SolConfig) and full.sol.min_sequence_length == 2048
+    assert full.attention_backend == "i4xi8"
+    assert full.default_steps == 24
+    assert full.loras == (
+        lora.LoRAEntry("a.safetensors", 1.0),
+        lora.LoRAEntry("b.safetensors", 0.75),
+        lora.LoRAEntry("c.safetensors", -0.25),
+        lora.LoRAEntry("style_alias", 0.6),
+        lora.LoRAEntry("same", 1.0),
+    )
+    assert overrides.RuntimeOverrides.from_dict(full.to_dict()) == full
+    assert overrides.RuntimeOverrides.from_dict({"attention_backend": "sage"}).attention_backend == "int8"
+    assert overrides.RuntimeOverrides.from_dict({"attention_backend": "flash"}).attention_backend == "fp16"
+
+    # Partial to_dict omits UNSET fields
+    partial = overrides.RuntimeOverrides(quality_enhance=False, block_cache=0.04)
+    assert partial.to_dict() == {"quality_enhance": False, "block_cache": 0.04}
+
+    # Fail-closed refusals
+    bad_payloads: list[Any] = [
+        {"unknown_dial": 1},
+        {1: "non_string_key"},
+        {"fbcache": 0.05, "block_cache": 0.1},
+        {"stepcache": 0.1, "step_cache": 0.2},
+        {"fbcache": True, "block_cache": 1.0},
+        {"quality_enhance": None},
+        {"quality_enhance": 1},
+        {"quality_enhance": "true"},
+        {"block_cache": None},
+        {"block_cache": -0.1},
+        {"block_cache": 100.1},
+        {"block_cache": True},
+        {"block_cache": float("nan")},
+        {"block_cache": float("inf")},
+        {"step_cache": None},
+        {"step_cache": -1.0},
+        {"step_cache": False},
+        {"step_cache": float("nan")},
+        {"sol": True},
+        {"sol": 1},
+        {"sol": "enabled"},
+        {"sol": ["bad"]},
+        {"sol": {"unknown": 1}},
+        {"attention_backend": None},
+        {"attention_backend": ""},
+        {"attention_backend": "   "},
+        {"attention_backend": "int8\x00"},
+        {"attention_backend": "nonexistent"},
+        {"default_steps": None},
+        {"default_steps": 0},
+        {"default_steps": -5},
+        {"default_steps": True},
+        {"default_steps": 4.5},
+        {"loras": None},
+        {"loras": "a.safetensors"},
+        {"loras": ""},
+        {"loras": b"a.safetensors"},
+        {"loras": {"path": "a.safetensors"}},
+        {"loras": [123]},
+        {"loras": [("only_one",)]},
+        {"loras": [("a.safetensors", 1.0, "extra")]},
+        {"loras": [("a.safetensors", True)]},
+        {"loras": [("a.safetensors", float("nan"))]},
+        {"loras": [("a.safetensors", float("inf"))]},
+        {"loras": ["a\x00b.safetensors"]},
+        {"loras": [{"scale": 0.5}]},
+        {"loras": [{"path": "a", "name": "b"}]},
+        {"loras": [{"path": "a", "extra": 1}]},
+        {"loras": [{"name": "a\x00b"}]},
+        {"loras": [{"path": "a", "scale": None}]},
+    ]
+    for bad in bad_payloads:
+        with pytest.raises(ValueError, match="."):
+            overrides.RuntimeOverrides.from_dict(bad)
+
+    for non_map in (123, ["a"], "str"):
+        with pytest.raises(ValueError):
+            overrides.RuntimeOverrides.from_dict(non_map)  # type: ignore[arg-type]
+        with pytest.raises(ValueError):
+            overrides.RuntimeOverrides.from_any(non_map)  # type: ignore[arg-type]
+
+
+# ── Test 38: LoRAManager O(1) stat-cached no-op, scale-only hit, invalidation & force ──
+
+
+def test_lora_manager_o1_noop_invalidation_and_force(
+    tmp_path: Path,
+    fake_qf_lib: FakeQFLib,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = struct.pack("<4f", 1.0, 2.0, 3.0, 4.0)
+    lora_a = _write_synthetic_safetensors(
+        tmp_path / "lora_a.safetensors",
+        {
+            "transformer_blocks.0.attn.to_q.lora_A.weight": ("F32", [2, 2], raw),
+            "transformer_blocks.0.attn.to_q.lora_B.weight": ("F32", [2, 2], raw),
+        },
+    )
+    lora_link = tmp_path / "lora_a_symlink.safetensors"
+    lora_link.symlink_to(lora_a)
+
+    eng = QFEngineHandle.create(fake_qf_lib, "/fake/m.safetensors", {"model_arch": "krea2"})
+    hdr_calls = {"n": 0}
+    rebind_calls = {"n": 0}
+    real_read_hdr = lora._read_safetensors_header
+
+    def spy_read_hdr(path: str) -> dict[str, Any]:
+        hdr_calls["n"] += 1
+        return real_read_hdr(path)
+
+    def spy_before_rebind() -> None:
+        rebind_calls["n"] += 1
+        eng.end_session_if_open()
+
+    monkeypatch.setattr(lora, "_read_safetensors_header", spy_read_hdr)
+    mgr = lora.LoRAManager(
+        eng,
+        cache_dir=tmp_path / "lora_cache",
+        lora_registry={"alias_a": lora_a},
+        on_before_rebind=spy_before_rebind,
+    )
+
+    try:
+        # 1. Empty unload / set_loras([]) on already-empty manager is O(1) no-op
+        eng.session_begin(512, 512, 4, (1, 16, 64), QF_DTYPE_BF16, {})
+        mgr.unload_loras()
+        mgr.set_loras([])
+        assert eng.current_session is not None
+        assert hdr_calls["n"] == 0
+        assert rebind_calls["n"] == 0
+        assert len(fake_qf_lib.loras_history) == 0
+
+        # 2. First bind reads header, triggers on_before_rebind, calls qf_xfm_set_loras
+        mgr.set_loras([(lora_a, 0.8)])
+        assert eng.current_session is None
+        assert hdr_calls["n"] == 1
+        assert rebind_calls["n"] == 1
+        assert len(fake_qf_lib.loras_history) == 1
+
+        # 3. Identical stack via direct path, symlink, relative path, and registry alias -> O(1) no-op
+        eng.session_begin(512, 512, 4, (1, 16, 64), QF_DTYPE_BF16, {})
+        mgr.set_loras([(lora_a, 0.8)])
+        mgr.set_loras([(lora_link, 0.8)])
+        mgr.set_loras([{"name": "alias_a", "scale": 0.8}])
+        monkeypatch.chdir(tmp_path)
+        mgr.set_loras([(Path("lora_a.safetensors"), 0.8)])
+        assert eng.current_session is not None  # Session never closed!
+        assert hdr_calls["n"] == 1
+        assert rebind_calls["n"] == 1
+        assert len(fake_qf_lib.loras_history) == 1
+
+        # 4. Scale-only change -> 0 header reads (hits _prepared_cache), triggers rebind + qf_xfm_set_loras
+        mgr.set_loras([(lora_a, 0.5)])
+        assert eng.current_session is None
+        assert hdr_calls["n"] == 1
+        assert rebind_calls["n"] == 2
+        assert len(fake_qf_lib.loras_history) == 2
+        assert fake_qf_lib.loras_history[-1][0]["scale"] == pytest.approx(0.5)
+
+        # 5. In-place disk modification (mtime_ns / size change) invalidates cache & re-reads header
+        raw2 = struct.pack("<8f", 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0)
+        _write_synthetic_safetensors(
+            lora_a,
+            {
+                "transformer_blocks.0.attn.to_q.lora_A.weight": ("F32", [2, 4], raw2),
+                "transformer_blocks.0.attn.to_q.lora_B.weight": ("F32", [4, 2], raw2),
+            },
+        )
+        old_st = os.stat(lora_a)
+        os.utime(lora_a, ns=(old_st.st_atime_ns, old_st.st_mtime_ns + 10_000_000))
+        mgr.set_loras([(lora_a, 0.5)])
+        assert hdr_calls["n"] == 2
+        assert rebind_calls["n"] == 3
+        assert len(fake_qf_lib.loras_history) == 3
+
+        # 6. Atomic replacement via os.replace (new inode, even with identical size & mtime_ns!) invalidates
+        st_before = os.stat(lora_a)
+        replacement = _write_synthetic_safetensors(
+            tmp_path / "lora_a_replacement.safetensors",
+            {
+                "transformer_blocks.0.attn.to_q.lora_A.weight": ("F32", [2, 4], raw2),
+                "transformer_blocks.0.attn.to_q.lora_B.weight": ("F32", [4, 2], raw2),
+            },
+        )
+        os.utime(replacement, ns=(st_before.st_atime_ns, st_before.st_mtime_ns))
+        os.replace(replacement, lora_a)
+        assert os.stat(lora_a).st_ino != st_before.st_ino
+        mgr.set_loras([(lora_a, 0.5)])
+        assert hdr_calls["n"] == 3
+        assert rebind_calls["n"] == 4
+        assert len(fake_qf_lib.loras_history) == 4
+
+        # 7. force=True bypasses both stack cache and _prepared_cache
+        mgr.set_loras([(lora_a, 0.5)], force=True)
+        assert hdr_calls["n"] == 4
+        assert rebind_calls["n"] == 5
+        assert len(fake_qf_lib.loras_history) == 5
+
+        # 8. Direct handle bypass (handle.set_loras([])) detected via applied_lora_sig cross-check
+        eng.set_loras([])
+        assert len(fake_qf_lib.loras_history) == 6
+        mgr.set_loras([(lora_a, 0.5)])
+        assert len(fake_qf_lib.loras_history) == 7
+
+        # 9. unload_loras sends [] once, then becomes O(1) no-op; unload_loras(force=True) forces call
+        mgr.unload_loras()
+        assert len(fake_qf_lib.loras_history) == 8
+        assert fake_qf_lib.loras_history[-1] == []
+        mgr.unload_loras()
+        mgr.set_loras([])
+        assert len(fake_qf_lib.loras_history) == 8
+        mgr.unload_loras(force=True)
+        assert len(fake_qf_lib.loras_history) == 9
+
+        # 10. Native qf_xfm_set_loras failure clears _bound_stack_sig so retry is NEVER skipped
+        mgr.set_loras([(lora_a, 0.5)])
+        assert len(fake_qf_lib.loras_history) == 10
+        orig_set = fake_qf_lib.qf_xfm_set_loras._fn
+
+        def _fail_once(xfm: Any, payload: Any) -> int:
+            return fake_qf_lib._fail(QF_ERR_INTERNAL, "injected lora bind failure")
+
+        fake_qf_lib.qf_xfm_set_loras._fn = _fail_once
+        with pytest.raises(RuntimeError, match="injected lora bind failure"):
+            mgr.set_loras([(lora_a, 0.9)])
+        assert mgr._bound_stack_sig is None
+
+        fake_qf_lib.qf_xfm_set_loras._fn = orig_set
+        # Retrying previously bound scale (0.5) MUST still rebind because cache was cleared on error
+        mgr.set_loras([(lora_a, 0.5)])
+        assert len(fake_qf_lib.loras_history) == 11
+    finally:
+        eng.destroy()
+
+
+# ── Test 39: LoRA registry & allowed_lora_roots LFI / path traversal defense ──
+
+
+def test_lora_registry_and_allowed_roots_lfi_defense(
+    tmp_path: Path,
+    fake_qf_lib: FakeQFLib,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = struct.pack("<4f", 1.0, 2.0, 3.0, 4.0)
+    root = tmp_path / "loras"
+    sub = root / "sub"
+    sub.mkdir(parents=True)
+    sibling_evil = tmp_path / "loras_evil"
+    sibling_evil.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    good_file = _write_synthetic_safetensors(
+        sub / "good.safetensors",
+        {
+            "transformer_blocks.0.attn.to_q.lora_A.weight": ("F32", [2, 2], raw),
+            "transformer_blocks.0.attn.to_q.lora_B.weight": ("F32", [2, 2], raw),
+        },
+    )
+    evil_sibling_file = _write_synthetic_safetensors(
+        sibling_evil / "evil.safetensors",
+        {"transformer_blocks.0.attn.to_q.lora_A.weight": ("F32", [2, 2], raw)},
+    )
+    outside_secret = _write_synthetic_safetensors(
+        outside / "secret.safetensors",
+        {"transformer_blocks.0.attn.to_q.lora_A.weight": ("F32", [2, 2], raw)},
+    )
+
+    sym_inside_ok = root / "sym_good.safetensors"
+    sym_inside_ok.symlink_to(good_file)
+    sym_escape_existing = root / "sym_escape_existing.safetensors"
+    sym_escape_existing.symlink_to(outside_secret)
+    sym_escape_missing = root / "sym_escape_missing.safetensors"
+    sym_escape_missing.symlink_to(outside / "does_not_exist.safetensors")
+
+    # Positive resolution: alias, inside root, and symlink staying inside root
+    assert (
+        lora.resolve_lora_path(
+            "style",
+            lora_registry={"style": good_file},
+            allowed_lora_roots=[root],
+            strict_registry=True,
+        )
+        == os.path.realpath(good_file)
+    )
+    assert lora.resolve_lora_path(good_file, allowed_lora_roots=[root]) == os.path.realpath(good_file)
+    assert lora.resolve_lora_path(sym_inside_ok, allowed_lora_roots=[root]) == os.path.realpath(good_file)
+
+    # All 6 attack vectors fail closed BEFORE os.stat/open (zero existence oracle!)
+    traversal_existing = str(root / ".." / "outside" / "secret.safetensors")
+    traversal_missing = str(root / ".." / "outside" / "nonexistent.safetensors")
+    sibling_missing = str(sibling_evil / "missing.safetensors")
+
+    eng = QFEngineHandle.create(fake_qf_lib, "/fake/m.safetensors", {"model_arch": "krea2"})
+    mgr = lora.LoRAManager(
+        eng,
+        cache_dir=tmp_path / "cache",
+        lora_registry={"style": good_file, "bad_alias": outside_secret},
+        allowed_lora_roots=[root],
+        strict_registry=False,
+    )
+    stat_targets: list[str] = []
+    hdr_reads = {"n": 0}
+    real_stat = lora.os.stat
+    real_hdr = lora._read_safetensors_header
+
+    def spy_stat(path: Any, *args: Any, **kwargs: Any) -> Any:
+        stat_targets.append(os.fspath(path))
+        return real_stat(path, *args, **kwargs)
+
+    def spy_hdr(path: str) -> dict[str, Any]:
+        hdr_reads["n"] += 1
+        return real_hdr(path)
+
+    monkeypatch.setattr(lora.os, "stat", spy_stat)
+    monkeypatch.setattr(lora, "_read_safetensors_header", spy_hdr)
+
+    try:
+        for attack in (
+            traversal_existing,
+            traversal_missing,
+            str(evil_sibling_file),
+            sibling_missing,
+            str(sym_escape_existing),
+            str(sym_escape_missing),
+            str(root),
+            str(root / "."),
+            "bad_alias",
+        ):
+            stat_targets.clear()
+            with pytest.raises(PermissionError):
+                mgr.set_loras([attack])
+            assert stat_targets == [], f"Existence oracle: os.stat called for rejected vector {attack!r}"
+            assert hdr_reads["n"] == 0
+
+        # NUL byte rejected with ValueError
+        with pytest.raises(ValueError):
+            lora.resolve_lora_path(f"{root}/bad\x00.safetensors", allowed_lora_roots=[root])
+
+        # strict_registry=True rejects unregistered path even inside allowed_lora_roots
+        mgr.configure_policy(strict_registry=True)
+        stat_targets.clear()
+        with pytest.raises(PermissionError):
+            mgr.set_loras([str(good_file)])
+        assert stat_targets == []
+        # Registered alias still allowed
+        mgr.set_loras(["style"])
+        assert len(fake_qf_lib.loras_history) == 1
+
+        # Inside-root nonexistent file and inside-root directory raise FileNotFoundError (404)
+        mgr.configure_policy(strict_registry=False)
+        with pytest.raises(FileNotFoundError):
+            mgr.set_loras([str(root / "missing_inside.safetensors")])
+        with pytest.raises(FileNotFoundError):
+            mgr.set_loras([str(sub)])
+
+        # Bare string allowed_lora_roots rejected (prevents char-by-char '/' root bug); empty list denies all
+        with pytest.raises(ValueError):
+            lora.resolve_lora_path(good_file, allowed_lora_roots=str(root))  # type: ignore[arg-type]
+        with pytest.raises(PermissionError):
+            lora.resolve_lora_path(good_file, allowed_lora_roots=[])
+    finally:
+        eng.destroy()
+
+
+# ── Test 40 (Mutation Arm M7): L1 security, stat invalidation & strict-keys mutations ──
+
+
+def test_mutation_m7_overrides_and_lora_security(
+    tmp_path: Path,
+    fake_qf_lib: FakeQFLib,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = struct.pack("<4f", 1.0, 2.0, 3.0, 4.0)
+    root = tmp_path / "loras"
+    root.mkdir()
+    sibling = tmp_path / "loras_evil"
+    sibling.mkdir()
+    evil_file = _write_synthetic_safetensors(
+        sibling / "x.safetensors",
+        {"transformer_blocks.0.attn.to_q.lora_A.weight": ("F32", [2, 2], raw)},
+    )
+    good_file = _write_synthetic_safetensors(
+        root / "good.safetensors",
+        {
+            "transformer_blocks.0.attn.to_q.lora_A.weight": ("F32", [2, 2], raw),
+            "transformer_blocks.0.attn.to_q.lora_B.weight": ("F32", [2, 2], raw),
+        },
+    )
+
+    # M7a: Replacing commonpath with naive str.startswith breaks sibling-prefix LFI rejection
+    with pytest.raises(PermissionError):
+        lora.resolve_lora_path(evil_file, allowed_lora_roots=[root])
+
+    real_commonpath = os.path.commonpath
+
+    def _naive_startswith_commonpath(paths: list[str]) -> str:
+        if len(paths) == 2 and paths[1].startswith(paths[0]):
+            return paths[0]
+        return real_commonpath(paths)
+
+    monkeypatch.setattr(lora.os.path, "commonpath", _naive_startswith_commonpath)
+    with pytest.raises((AssertionError, pytest.fail.Exception)):
+        with pytest.raises(PermissionError):
+            lora.resolve_lora_path(evil_file, allowed_lora_roots=[root])
+    monkeypatch.undo()
+
+    # M7b: Ignoring mtime_ns/size/ino (constant stat fingerprint) breaks disk-modification invalidation
+    eng = QFEngineHandle.create(fake_qf_lib, "/fake/m.safetensors", {"model_arch": "krea2"})
+    try:
+        mgr = lora.LoRAManager(eng, cache_dir=tmp_path / "cache")
+        mgr.set_loras([(good_file, 0.8)])
+        assert len(fake_qf_lib.loras_history) == 1
+
+        # Rewrite file on disk -> production code invalidates and rebinds
+        raw2 = struct.pack("<8f", 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0)
+        _write_synthetic_safetensors(
+            good_file,
+            {
+                "transformer_blocks.0.attn.to_q.lora_A.weight": ("F32", [2, 4], raw2),
+                "transformer_blocks.0.attn.to_q.lora_B.weight": ("F32", [4, 2], raw2),
+            },
+        )
+        st_cur = os.stat(good_file)
+        os.utime(good_file, ns=(st_cur.st_atime_ns, st_cur.st_mtime_ns + 5_000_000))
+        mgr.set_loras([(good_file, 0.8)])
+        assert len(fake_qf_lib.loras_history) == 2
+
+        # Mutate os.stat so (mtime_ns, size, ino) appear constant -> disk change fails to rebind!
+        frozen_st = os.stat(good_file)
+        monkeypatch.setattr(lora.os, "stat", lambda path: frozen_st)
+        _write_synthetic_safetensors(
+            good_file,
+            {
+                "transformer_blocks.0.attn.to_q.lora_A.weight": ("F32", [2, 2], raw),
+                "transformer_blocks.0.attn.to_q.lora_B.weight": ("F32", [2, 2], raw),
+            },
+        )
+        mgr.set_loras([(good_file, 0.8)])
+        with pytest.raises(AssertionError):
+            assert len(fake_qf_lib.loras_history) == 3
+        monkeypatch.undo()
+    finally:
+        eng.destroy()
+
+    # M7c: Dropping unknown-key rejection in RuntimeOverrides.from_dict turns refusal assertion red
+    with pytest.raises(ValueError, match="Unknown"):
+        overrides.RuntimeOverrides.from_dict({"unknown_dial": 1})
+
+    orig_from_dict = overrides.RuntimeOverrides.from_dict.__func__
+
+    def _permissive_from_dict(cls: type[overrides.RuntimeOverrides], data: dict[str, Any]) -> overrides.RuntimeOverrides:
+        filtered = {k: v for k, v in data.items() if k in overrides._ALLOWED_KEYS}
+        return orig_from_dict(cls, filtered)
+
+    monkeypatch.setattr(overrides.RuntimeOverrides, "from_dict", classmethod(_permissive_from_dict))
+    with pytest.raises((AssertionError, pytest.fail.Exception)):
+        with pytest.raises(ValueError):
+            overrides.RuntimeOverrides.from_dict({"unknown_dial": 1})
+    monkeypatch.undo()

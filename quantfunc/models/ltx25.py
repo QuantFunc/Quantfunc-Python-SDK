@@ -429,6 +429,21 @@ class QuantFuncLTX25Transformer3DModel(QuantFuncBaseTransformer):
         self._bound_disable_av_cross_attn = False
         return was_open, ok
 
+    def reset_request_state(self) -> None:
+        """Clear per-request session, ref_audio (healing stuck pending borrows), STG, and cross-attn state."""
+        super().reset_request_state()
+        try:
+            if not self._closed and self._handle is not None and self._handle.xfm is not None:
+                if self._handle.reference_audio_pending():
+                    self._handle.unload_sync()
+                self.set_reference_audio(None)
+            else:
+                self._ref_audio_state = None
+                self._ref_audio_bound = False
+        finally:
+            self._bound_stg_blocks = ()
+            self._bound_disable_av_cross_attn = False
+
     # ── Latent-level frozen audio restoration ───────────────────────────────
 
     @staticmethod

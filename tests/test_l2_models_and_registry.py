@@ -33,7 +33,7 @@ from quantfunc.models import (
     restore_frozen_audio,
 )
 from quantfunc.native.capi import QF_MAX_STEP_REF_AREA, QF_MAX_STEP_REFS, QF_UINT64_MAX
-from quantfunc.native.errors import InvalidArgError
+from quantfunc.native.errors import InvalidArgError, OutOfMemoryError
 
 
 def _write_safetensors(path: Path, tensors: dict[str, tuple[list[int], str, bytes]], metadata: dict[str, str] | None = None) -> Path:
@@ -1236,5 +1236,317 @@ def test_mutation_all_4_models(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
         del hold
         with pytest.raises(AssertionError):
             assert len(lib_h.sessions) == 1
+    finally:
+        mh.close()
+
+
+# ── Test 41: L2 reset_request_state() across all 4 models + O(1) LoRA & cross-GPU policy ──
+
+
+def test_l2_reset_request_state_and_lora_policy_preservation(tmp_path: Path) -> None:
+    lora_root = tmp_path / "allowed_loras"
+    lora_root.mkdir()
+    outside_dir = tmp_path / "outside_loras"
+    outside_dir.mkdir()
+    style_lora = _make_dummy_lora(lora_root / "style.safetensors")
+    outside_lora = _make_dummy_lora(outside_dir / "escape.safetensors")
+
+    # 1. Base / Krea-2: O(1) LoRA preserves active session, to("cuda:1") preserves policy & force-rebinds,
+    #    and reset_request_state() clears transient state while preserving base weights, LoRAs & dials.
+    lib_k = FakeQFLib()
+    ckpt_k = _make_dummy_checkpoint(tmp_path / "krea2-r4.safetensors")
+    mk = QuantFuncKrea2Transformer2DModel.from_pretrained(ckpt_k, lib=lib_k, torch_dtype=torch.float32)
+    try:
+        mk.configure_lora_policy(
+            lora_registry={"style": style_lora},
+            allowed_lora_roots=[lora_root],
+            strict_registry=True,
+        )
+        with pytest.raises(PermissionError):
+            mk.set_loras([outside_lora])
+        with pytest.raises(PermissionError):
+            mk.set_loras([style_lora])  # unregistered raw path refused under strict_registry=True
+
+        mk.set_loras([{"name": "style", "scale": 0.75}])
+        assert len(lib_k.loras_history) == 1
+        assert len(mk.active_loras) == 1
+
+        mk.set_quality_enhance(True)
+        mk.set_cache(block_cache=0.05)
+        mk.set_staged_schedule(StagedSchedule(sigmas=(1.0, 0.5, 0.0), num_steps=2))
+        mk._active_cache_context = "cond"
+
+        xk = torch.randn(1, 64, 2, 2, dtype=torch.float32)
+        ck = torch.randn(1, 4, 2560, dtype=torch.float32)
+        mk(xk, encoder_hidden_states=ck, timestep=0.5)
+        assert mk._session_is_open() is True
+        assert lib_k.sessions[-1]["ended"] is False
+
+        # O(1) LoRA no-op MUST keep active session open and avoid qf_xfm_set_loras
+        mk.set_loras([{"name": "style", "scale": 0.75}])
+        assert mk._session_is_open() is True
+        assert lib_k.sessions[-1]["ended"] is False
+        assert len(lib_k.loras_history) == 1
+
+        # Cross-GPU to("cuda:1") preserves lora_registry/allowed_lora_roots/strict_registry & force-rebinds
+        mk.to("cuda:1")
+        assert lib_k.created_configs[-1]["device_id"] == 1
+        assert len(lib_k.loras_history) == 2
+        assert lib_k.loras_history[-1][0]["scale"] == pytest.approx(0.75)
+        with pytest.raises(PermissionError):
+            mk.set_loras([outside_lora])
+        with pytest.raises(PermissionError):
+            mk.set_loras([style_lora])
+        mk.set_loras([{"name": "style", "scale": 0.75}])  # still O(1) hit via preserved registry
+        assert len(lib_k.loras_history) == 2
+
+        # reset_request_state() clears session, schedule, sigmas, cache_context, scratch; keeps VRAM, LoRAs, dials
+        mk(xk, encoder_hidden_states=ck, timestep=0.5)
+        assert mk._session_is_open() is True
+        assert len(mk._scratch) > 0
+        vram_before_k = mk.resident_vram_bytes()
+        loras_before_k = list(mk.active_loras)
+        mk.reset_request_state()
+        assert mk._session_is_open() is False
+        assert mk._staged_schedule is None
+        assert mk._sol_sigmas is None
+        assert mk._active_cache_context is None
+        assert mk._scratch == {}
+        assert mk.resident_vram_bytes() == vram_before_k
+        assert mk.active_loras == loras_before_k
+        assert mk.quality_enhance is True
+        assert mk.block_cache == pytest.approx(0.05)
+    finally:
+        mk.close()
+
+    # 2. LTX-2.5: ref_audio + STG + isolate_modalities isolation + pending ref_audio OOM self-heal
+    lib_l = FakeQFLib()
+    ckpt_l = _make_dummy_checkpoint(
+        tmp_path / "ltx25-r4.safetensors",
+        tensor_keys=[
+            "model.diffusion_model.video_embeddings_connector.w",
+            "model.diffusion_model.audio_embeddings_connector.w",
+        ],
+    )
+    ml = QuantFuncLTX25Transformer3DModel.from_pretrained(ckpt_l, lib=lib_l, torch_dtype=torch.float32)
+    try:
+        vl = torch.randn(1, 128, 2, 2, 2, dtype=torch.float32)
+        al = torch.randn(1, 8, 4, 16, dtype=torch.float32)
+        vc = torch.randn(1, 4, 4096, dtype=torch.float32)
+        ac = torch.randn(1, 4, 2048, dtype=torch.float32)
+        ref_a1 = torch.randn(1, 4, 128, dtype=torch.float32)
+
+        ml(
+            vl,
+            audio_hidden_states=al,
+            encoder_hidden_states=vc,
+            audio_encoder_hidden_states=ac,
+            timestep=0.8,
+            ref_audio=ref_a1,
+            spatio_temporal_guidance_blocks=[28],
+            isolate_modalities=True,
+        )
+        assert "av_conds" in lib_l.sessions[-1]["options"]
+        assert lib_l.steps[-1]["audio_reference_active"] == 1
+        assert lib_l.sessions[-1]["options"]["stg_blocks"] == [28]
+        assert lib_l.sessions[-1]["options"]["disable_av_cross_attn"] is True
+
+        vram_before_l = ml.resident_vram_bytes()
+        ml.reset_request_state()
+        assert ml._ref_audio_state is None
+        assert ml._ref_audio_bound is False
+        assert ml._bound_stg_blocks == ()
+        assert ml._bound_disable_av_cross_attn is False
+        assert ml.resident_vram_bytes() == vram_before_l
+
+        # Request 2 without ref_audio / STG sees zero leakage
+        ml(
+            vl,
+            audio_hidden_states=al,
+            encoder_hidden_states=vc,
+            audio_encoder_hidden_states=ac,
+            timestep=0.8,
+        )
+        assert "av_conds" not in lib_l.sessions[-1]["options"]
+        assert "stg_blocks" not in lib_l.sessions[-1]["options"]
+        assert "disable_av_cross_attn" not in lib_l.sessions[-1]["options"]
+        assert lib_l.steps[-1]["audio_reference_active"] == 0
+        ml.reset_request_state()
+
+        # Simulate session_begin failing with OutOfMemoryError AFTER retain_reference_audio -> stuck pending borrow
+        orig_begin = ml._handle.session_begin
+
+        def _boom_begin(*args: Any, **kwargs: Any) -> Any:
+            raise OutOfMemoryError("simulated OOM during session_begin")
+
+        ml._handle.session_begin = _boom_begin  # type: ignore[method-assign]
+        ref_a2 = torch.randn(1, 4, 128, dtype=torch.float32)
+        with pytest.raises(OutOfMemoryError, match="simulated OOM"):
+            ml(
+                vl,
+                audio_hidden_states=al,
+                encoder_hidden_states=vc,
+                audio_encoder_hidden_states=ac,
+                timestep=0.9,
+                ref_audio=ref_a2,
+            )
+        assert ml._handle.reference_audio_pending() is True
+        ml._handle.session_begin = orig_begin  # type: ignore[method-assign]
+
+        # reset_request_state() self-heals via unload_sync() without freeing resident model weights
+        unloads_before = len(lib_l.unloads)
+        ml.reset_request_state()
+        assert len(lib_l.unloads) == unloads_before + 1
+        assert lib_l.unloads[-1] == 0
+        assert ml._handle.reference_audio_pending() is False
+        assert ml.resident_vram_bytes() == vram_before_l
+
+        # Subsequent request works cleanly (no permanent pending-copy lockup)
+        ml(
+            vl,
+            audio_hidden_states=al,
+            encoder_hidden_states=vc,
+            audio_encoder_hidden_states=ac,
+            timestep=0.7,
+        )
+        assert lib_l.steps[-1]["audio_reference_active"] == 0
+        assert "av_conds" not in lib_l.sessions[-1]["options"]
+    finally:
+        ml.close()
+
+    # 3. MiniMax-H3: reset_request_state() clears _av_conditions & _av_cond_device_cache
+    lib_h = FakeQFLib(echo_scale=1.0)
+    ckpt_h = _make_dummy_checkpoint(tmp_path / "minimax-h3-r4.safetensors")
+    mh = QuantFuncMiniMaxH3Transformer3DModel.from_pretrained(ckpt_h, lib=lib_h, torch_dtype=torch.float32)
+    try:
+        kf = torch.randn(1, 24, 1, 4, 4, dtype=torch.float32)
+        vh = torch.ones(1, 24, 2, 4, 4, dtype=torch.float32)
+        ah = torch.ones(1, 32, 2, 3, dtype=torch.float32)
+        ch = torch.randn(1, 4, 5120, dtype=torch.float32)
+        mh.set_av_conditions(keyframes=[{"latent": kf, "frame_index": 0}], text_token_tags=[0, 1, 0])
+        mh(vh, audio_hidden_states=ah, encoder_hidden_states=ch, timestep=0.25)
+        assert "av_conds" in lib_h.sessions[-1]["options"]
+        assert len(mh._av_cond_device_cache) == 1
+
+        vram_before_h = mh.resident_vram_bytes()
+        mh.reset_request_state()
+        assert mh._av_conditions is None
+        assert mh._av_cond_device_cache == {}
+        assert mh._session_is_open() is False
+        assert mh.resident_vram_bytes() == vram_before_h
+
+        # Request 2 has zero av_conds leakage
+        mh(vh, audio_hidden_states=ah, encoder_hidden_states=ch, timestep=0.25)
+        assert "av_conds" not in lib_h.sessions[-1]["options"]
+        assert "text_vision_row_ranges" not in lib_h.sessions[-1]["options"]
+    finally:
+        mh.close()
+
+    # 4. Qwen-Image-2.1: reset_request_state() clears _staged_schedule/_sol_sigmas/_split_cfg_forced_full
+    lib_q = FakeQFLib()
+    ckpt_q = _make_dummy_checkpoint(tmp_path / "qwen-image-2.1-r4.safetensors")
+    mq = QuantFuncQwenImage21Transformer2DModel.from_pretrained(ckpt_q, lib=lib_q, torch_dtype=torch.float32)
+    try:
+        mq.set_loras([style_lora])
+        xq = torch.randn(1, 64, 4, 4, dtype=torch.float32)
+        cq1 = torch.ones(1, 6, 4096, dtype=torch.float32)
+        cq2 = torch.full((1, 6, 4096), 2.0, dtype=torch.float32)
+        # Trigger split-CFG escalation to ratio 1.0
+        mq(xq, encoder_hidden_states=cq1, timestep=1.0)
+        mq(xq, encoder_hidden_states=cq2, timestep=1.0)
+        assert mq._split_cfg_forced_full is True
+        mq.set_sol_sigmas([1.0, 0.5, 0.0])
+
+        vram_before_q = mq.resident_vram_bytes()
+        loras_before_q = list(mq.active_loras)
+        mq.reset_request_state()
+        assert mq._session_is_open() is False
+        assert mq._staged_schedule is None
+        assert mq._sol_sigmas is None
+        assert mq._split_cfg_forced_full is False
+        assert mq._session_opened_ratio is None
+        assert mq._last_sigma is None
+        assert mq._scratch == {}
+        assert mq.resident_vram_bytes() == vram_before_q
+        assert mq.active_loras == loras_before_q
+
+        # Request 2 single-pass T2I starts fresh at 0.85 (no leaked split-CFG escalation)
+        mq(xq, encoder_hidden_states=cq1, timestep=1.0)
+        assert lib_q.sessions[-1]["options"][WIRE_QUALITY_RATIO_KEY] == pytest.approx(0.85)
+    finally:
+        mq.close()
+
+
+# ── Test 42 (Mutation Arm M8): Breaking LTX-2.5 / MiniMax-H3 request isolation turns RED ──
+
+
+def test_mutation_m8_l2_request_isolation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # (a) LTX-2.5 mutations: (a1) skipping set_reference_audio(None); (a2) skipping unload_sync()
+    lib_l = FakeQFLib()
+    ckpt_l = _make_dummy_checkpoint(
+        tmp_path / "m8_ltx25.safetensors",
+        tensor_keys=[
+            "model.diffusion_model.video_embeddings_connector.w",
+            "model.diffusion_model.audio_embeddings_connector.w",
+        ],
+    )
+    ml = QuantFuncLTX25Transformer3DModel.from_pretrained(ckpt_l, lib=lib_l, torch_dtype=torch.float32)
+    try:
+        vl = torch.randn(1, 128, 2, 2, 2, dtype=torch.float32)
+        al = torch.randn(1, 8, 4, 16, dtype=torch.float32)
+        vc = torch.randn(1, 4, 4096, dtype=torch.float32)
+        ac = torch.randn(1, 4, 2048, dtype=torch.float32)
+        ref_a = torch.randn(1, 4, 128, dtype=torch.float32)
+
+        # (a1) Skip set_reference_audio(None) -> Request 2 leaks audio_reference_active == 1
+        ml(vl, audio_hidden_states=al, encoder_hidden_states=vc, audio_encoder_hidden_states=ac, timestep=0.8, ref_audio=ref_a)
+        monkeypatch.setattr(ml, "set_reference_audio", lambda x: None)
+        ml.reset_request_state()
+        monkeypatch.undo()
+        ml(vl, audio_hidden_states=al, encoder_hidden_states=vc, audio_encoder_hidden_states=ac, timestep=0.8)
+        with pytest.raises(AssertionError):
+            assert lib_l.steps[-1]["audio_reference_active"] == 0
+        ml.reset_request_state()
+
+        # (a2) Skip unload_sync() on pending ref_audio -> reset_request_state() fails self-heal!
+        orig_begin = ml._handle.session_begin
+        monkeypatch.setattr(
+            ml._handle,
+            "session_begin",
+            lambda *a, **kw: (_ for _ in ()).throw(OutOfMemoryError("oom")),
+        )
+        with pytest.raises(OutOfMemoryError):
+            ml(vl, audio_hidden_states=al, encoder_hidden_states=vc, audio_encoder_hidden_states=ac, timestep=0.9, ref_audio=ref_a)
+        assert ml._handle.reference_audio_pending() is True
+        monkeypatch.setattr(ml._handle, "session_begin", orig_begin)
+        monkeypatch.setattr(ml._handle, "unload_sync", lambda: 0)
+        with pytest.raises(RuntimeError, match="pending copy completion"):
+            ml.reset_request_state()
+        monkeypatch.undo()
+        ml.reset_request_state()
+        assert ml._handle.reference_audio_pending() is False
+    finally:
+        ml.close()
+
+    # (b) MiniMax-H3 mutation: skipping clear_av_conditions() leaks av_conds & GPU cache
+    lib_h = FakeQFLib(echo_scale=1.0)
+    ckpt_h = _make_dummy_checkpoint(tmp_path / "m8_h3.safetensors")
+    mh = QuantFuncMiniMaxH3Transformer3DModel.from_pretrained(ckpt_h, lib=lib_h, torch_dtype=torch.float32)
+    try:
+        kf = torch.randn(1, 24, 1, 4, 4, dtype=torch.float32)
+        vh = torch.ones(1, 24, 2, 4, 4, dtype=torch.float32)
+        ah = torch.ones(1, 32, 2, 3, dtype=torch.float32)
+        ch = torch.randn(1, 4, 5120, dtype=torch.float32)
+        mh.set_av_conditions(keyframes=[{"latent": kf, "frame_index": 0}])
+        mh(vh, audio_hidden_states=ah, encoder_hidden_states=ch, timestep=0.25)
+
+        monkeypatch.setattr(mh, "clear_av_conditions", lambda: None)
+        mh.reset_request_state()
+        monkeypatch.undo()
+        with pytest.raises(AssertionError):
+            assert mh._av_cond_device_cache == {}
+        mh(vh, audio_hidden_states=ah, encoder_hidden_states=ch, timestep=0.25)
+        with pytest.raises(AssertionError):
+            assert "av_conds" not in lib_h.sessions[-1]["options"]
     finally:
         mh.close()

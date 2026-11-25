@@ -371,6 +371,11 @@ class QuantFuncMiniMaxH3Transformer3DModel(QuantFuncBaseTransformer):
         self._av_cond_version += 1
         self._av_cond_device_cache.clear()
 
+    def reset_request_state(self) -> None:
+        """Clear per-request session, schedule, and bound AV conditions / GPU keepalive cache."""
+        super().reset_request_state()
+        self.clear_av_conditions()
+
     def close(self) -> None:
         """Close any active session, clear cached condition tensors, and destroy the engine handle."""
         self._av_cond_device_cache.clear()

@@ -9,8 +9,8 @@ import logging
 import math
 import struct
 import warnings
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, fields
 from typing import Any
 
 _log = logging.getLogger(__name__)
@@ -237,6 +237,66 @@ class SolConfig:
     def from_legacy(cls, sol_tau: float | None = None) -> SolConfig:
         """Build a ``SolConfig`` from a legacy v1 fraction (0 or ~1 disables Sol)."""
         return from_legacy(sol_tau)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> SolConfig:
+        """Build a validated ``SolConfig`` from a JSON mapping (accepts wire alias ``min_tokens``)."""
+        if not isinstance(data, Mapping):
+            raise ValueError(f"SolConfig.from_dict requires a mapping, got {type(data).__name__}")
+        valid_fields = frozenset(f.name for f in fields(cls))
+        allowed = valid_fields | {"min_tokens"}
+        unknown: list[str] = []
+        for k in data:
+            if not isinstance(k, str):
+                raise ValueError(f"SolConfig keys must be strings, got {type(k).__name__}")
+            if k not in allowed:
+                unknown.append(k)
+        if unknown:
+            raise ValueError(f"Unknown SolConfig key(s): {', '.join(sorted(unknown))}")
+
+        kwargs: dict[str, Any] = {}
+        has_min_len = "min_sequence_length" in data
+        has_min_tok = "min_tokens" in data
+        if has_min_len and has_min_tok:
+            v_len = _require_int(data["min_sequence_length"], "min_sequence_length")
+            v_tok = _require_int(data["min_tokens"], "min_tokens")
+            if v_len != v_tok:
+                raise ValueError(
+                    f"Conflicting SolConfig values for 'min_sequence_length' ({v_len}) and alias 'min_tokens' ({v_tok})"
+                )
+            kwargs["min_sequence_length"] = v_len
+        elif has_min_tok:
+            kwargs["min_sequence_length"] = data["min_tokens"]
+
+        for k, v in data.items():
+            if k == "min_tokens" or (k == "min_sequence_length" and has_min_tok):
+                continue
+            kwargs[k] = v
+
+        return cls(**kwargs)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize all 18 canonical ``SolConfig`` fields into a JSON-compatible dictionary."""
+        return {
+            "enabled": bool(self.enabled),
+            "tau": float(self.tau),
+            "selector": str(self.selector),
+            "window_enabled": bool(self.window_enabled),
+            "start_percent": float(self.start_percent),
+            "end_percent": float(self.end_percent),
+            "sigma_start": None if self.sigma_start is None else float(self.sigma_start),
+            "sigma_end": None if self.sigma_end is None else float(self.sigma_end),
+            "min_sequence_length": int(self.min_sequence_length),
+            "sink_conditioning": str(self.sink_conditioning),
+            "first_layers_dense": None if self.first_layers_dense is None else int(self.first_layers_dense),
+            "first_steps_dense": None if self.first_steps_dense is None else int(self.first_steps_dense),
+            "first_steps_dense_frac": None if self.first_steps_dense_frac is None else float(self.first_steps_dense_frac),
+            "plan_interval": None if self.plan_interval is None else int(self.plan_interval),
+            "auto_dense_guard": None if self.auto_dense_guard is None else bool(self.auto_dense_guard),
+            "require_permute": None if self.require_permute is None else bool(self.require_permute),
+            "top_p": None if self.top_p is None else float(self.top_p),
+            "cdf": None if self.cdf is None else float(self.cdf),
+        }
 
     def to_native(
         self,

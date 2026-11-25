@@ -32,7 +32,7 @@ from quantfunc.core.config import (
     normalize_attention_backend,
     resolve_auth,
 )
-from quantfunc.core.lora import LoRAEntry, LoRAManager
+from quantfunc.core.lora import LoRAEntry, LoRAManager, normalize_lora_entries
 from quantfunc.core.registry import get_model_spec
 from quantfunc.core.session import (
     DEFAULT_AUTO_SESSION_MAX_STEPS,
@@ -204,32 +204,6 @@ def _parse_to_args(*args: Any, **kwargs: Any) -> tuple[torch.device | None, torc
         return device, dtype
 
 
-def _normalize_lora_entries(
-    loras: Sequence[
-        LoRAEntry | tuple[str | os.PathLike[str], float] | Mapping[str, Any] | str | os.PathLike[str]
-    ]
-    | None,
-) -> list[LoRAEntry]:
-    """Normalize user LoRA specs into a list of LoRAEntry objects."""
-    if not loras:
-        return []
-    entries: list[LoRAEntry] = []
-    for item in loras:
-        if isinstance(item, LoRAEntry):
-            entries.append(item)
-        elif isinstance(item, str | os.PathLike):
-            entries.append(LoRAEntry(path=str(item), scale=1.0))
-        elif isinstance(item, Mapping):
-            entries.append(LoRAEntry(path=str(item["path"]), scale=float(item.get("scale", 1.0))))
-        elif isinstance(item, tuple) and len(item) == 2:
-            entries.append(LoRAEntry(path=str(item[0]), scale=float(item[1])))
-        else:
-            raise TypeError(
-                f"Unsupported LoRA entry {item!r}; expected LoRAEntry, path, or (path, scale) tuple"
-            )
-    return entries
-
-
 def _validate_positive_int(value: Any, name: str) -> int:
     """Validate that value is a strictly positive integer (excluding bool)."""
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -290,8 +264,10 @@ class QuantFuncBaseTransformer(_BaseModelMixin, _BaseConfigMixin, _BaseCacheMixi
         self._auth_config: AuthConfig | None = auth_config
         self._extra_create_config: dict[str, Any] = dict(extra_create_config or {})
 
-        self._lora_manager: LoRAManager = LoRAManager(self._handle)
-        self._active_loras: list[LoRAEntry] = []
+        self._lora_manager: LoRAManager = LoRAManager(
+            self._handle,
+            on_before_rebind=self._end_session_if_open,
+        )
 
         self._default_steps: int = int(DEFAULT_AUTO_SESSION_MAX_STEPS)
         self._session_tracker: AutoSessionTracker = AutoSessionTracker(
@@ -649,7 +625,12 @@ class QuantFuncBaseTransformer(_BaseModelMixin, _BaseConfigMixin, _BaseCacheMixi
     def _recreate_handle_on_device(self, new_device_id: int) -> None:
         """Destroy current engine handle and recreate it on a new CUDA device index."""
         self._end_session_if_open()
-        saved_loras = list(self._active_loras)
+        old_lora_mgr = self._lora_manager
+        saved_loras = list(old_lora_mgr.active_loras)
+        saved_cache_dir = old_lora_mgr.cache_dir
+        saved_registry = old_lora_mgr.lora_registry
+        saved_roots = old_lora_mgr.allowed_lora_roots
+        saved_strict = old_lora_mgr.strict_registry
         if self._lib is None or not self._weights_path:
             raise RuntimeError(
                 "Cannot migrate transformer to another GPU without native library and weights_path"
@@ -679,7 +660,14 @@ class QuantFuncBaseTransformer(_BaseModelMixin, _BaseConfigMixin, _BaseCacheMixi
             config_json=create_dict,
         )
         self._handle = new_handle
-        self._lora_manager = LoRAManager(new_handle)
+        self._lora_manager = LoRAManager(
+            new_handle,
+            cache_dir=saved_cache_dir,
+            lora_registry=saved_registry,
+            allowed_lora_roots=saved_roots,
+            strict_registry=saved_strict,
+            on_before_rebind=self._end_session_if_open,
+        )
         self._session_tracker = AutoSessionTracker(
             new_handle,
             default_steps=self._default_steps,
@@ -687,7 +675,7 @@ class QuantFuncBaseTransformer(_BaseModelMixin, _BaseConfigMixin, _BaseCacheMixi
         if self._staged_schedule is not None:
             self._session_tracker.set_schedule(self._staged_schedule)
         if saved_loras:
-            self.set_loras(saved_loras)
+            self.set_loras(saved_loras, force=True)
 
     # ── CacheMixin integration ──────────────────────────────────────────────
 
@@ -727,32 +715,74 @@ class QuantFuncBaseTransformer(_BaseModelMixin, _BaseConfigMixin, _BaseCacheMixi
 
     # ── LoRA management ─────────────────────────────────────────────────────
 
-    def load_lora(self, path: str | os.PathLike[str], scale: float = 1.0) -> None:
+    def configure_lora_policy(
+        self,
+        *,
+        lora_registry: Any = ...,
+        allowed_lora_roots: Any = ...,
+        strict_registry: Any = ...,
+    ) -> None:
+        """Configure default LoRA alias registry, allowed roots, and strict registry mode."""
+        self._lora_manager.configure_policy(
+            lora_registry=lora_registry,
+            allowed_lora_roots=allowed_lora_roots,
+            strict_registry=strict_registry,
+        )
+
+    def load_lora(
+        self,
+        path: str | os.PathLike[str],
+        scale: float = 1.0,
+        *,
+        force: bool = False,
+        lora_registry: Mapping[str, str | os.PathLike[str]] | None = None,
+        allowed_lora_roots: Sequence[str | os.PathLike[str]] | None = None,
+        strict_registry: bool | None = None,
+    ) -> None:
         """Hot-load a single LoRA adapter into the live engine handle."""
-        self.set_loras([LoRAEntry(path=str(path), scale=float(scale))])
+        self.set_loras(
+            [LoRAEntry(path=os.fspath(path), scale=scale)],
+            force=force,
+            lora_registry=lora_registry,
+            allowed_lora_roots=allowed_lora_roots,
+            strict_registry=strict_registry,
+        )
 
     def set_loras(
         self,
         loras: Sequence[
-            LoRAEntry | tuple[str | os.PathLike[str], float] | Mapping[str, Any] | str | os.PathLike[str]
+            LoRAEntry
+            | tuple[str | os.PathLike[str], float]
+            | list[Any]
+            | Mapping[str, Any]
+            | str
+            | os.PathLike[str]
         ],
+        *,
+        force: bool = False,
+        lora_registry: Mapping[str, str | os.PathLike[str]] | None = None,
+        allowed_lora_roots: Sequence[str | os.PathLike[str]] | None = None,
+        strict_registry: bool | None = None,
     ) -> None:
-        """Hot-swap the active LoRA stack without rebuilding the engine handle."""
-        entries = _normalize_lora_entries(loras)
-        self._end_session_if_open()
+        """Hot-swap the active LoRA stack without rebuilding the engine handle (O(1) no-op on identical stack)."""
+        entries = normalize_lora_entries(loras)
         eff_model_path = (
             self._weights_path
             if (self._weights_path is not None and os.path.isfile(self._weights_path))
             else None
         )
-        self._lora_manager.set_loras(entries, model_path=eff_model_path)
-        self._active_loras = list(entries)
+        self._lora_manager.set_loras(
+            entries,
+            model_path=eff_model_path,
+            lora_registry=lora_registry,
+            allowed_lora_roots=allowed_lora_roots,
+            strict_registry=strict_registry,
+            force=force,
+        )
 
-    def unload_loras(self) -> None:
-        """Clear all active LoRA adapters by sending [] to the engine."""
-        self._end_session_if_open()
-        self._lora_manager.unload_loras()
-        self._active_loras = []
+    def unload_loras(self, *, force: bool = False) -> None:
+        """Clear all active LoRA adapters by sending [] to the engine (O(1) no-op when already empty)."""
+        self._lora_manager.unload_loras(force=force)
 
     def load_lora_adapter(self, *args: Any, **kwargs: Any) -> None:
         """Unsupported diffusers PEFT entrypoint; directs users to native load_lora()."""
@@ -806,7 +836,7 @@ class QuantFuncBaseTransformer(_BaseModelMixin, _BaseConfigMixin, _BaseCacheMixi
 
     @property
     def active_loras(self) -> list[LoRAEntry]:
-        return list(self._active_loras)
+        return list(self._lora_manager.active_loras)
 
     def set_cache(
         self,
@@ -964,6 +994,18 @@ class QuantFuncBaseTransformer(_BaseModelMixin, _BaseConfigMixin, _BaseCacheMixi
     def end_session_if_open(self) -> tuple[bool, bool]:
         """Close any active engine session and clear scratch buffers."""
         return self._end_session_if_open()
+
+    def reset_request_state(self) -> None:
+        """Clear per-request transient session/schedule/scratch state without unloading weights or LoRAs."""
+        if not self._closed:
+            self._end_session_if_open()
+        else:
+            self._release_scratch()
+            self._reset_timestep_scale_tracking()
+        self.set_staged_schedule(None)
+        self._sol_sigmas = None
+        self._active_cache_context = None
+        self._release_scratch()
 
     def _reset_timestep_scale_tracking(self) -> None:
         self._session_saw_scaled_timestep = False

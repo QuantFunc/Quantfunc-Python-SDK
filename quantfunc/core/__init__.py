@@ -39,7 +39,13 @@ from .lora import (
     LoRAManager,
     convert_lora_file,
     detect_lora_format,
+    normalize_lora_entries,
+    resolve_lora_path,
     unsupported_lora_kind,
+)
+from .overrides import (
+    UNSET,
+    RuntimeOverrides,
 )
 from .registry import (
     ModelSpec,
@@ -99,10 +105,15 @@ __all__ = [
     "AutoSessionTracker",
     # lora
     "LoRAEntry",
+    "normalize_lora_entries",
+    "resolve_lora_path",
     "detect_lora_format",
     "unsupported_lora_kind",
     "convert_lora_file",
     "LoRAManager",
+    # overrides
+    "UNSET",
+    "RuntimeOverrides",
     # checkpoint
     "PresetMetadata",
     "name_matches_hints",
