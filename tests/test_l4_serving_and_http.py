@@ -23,18 +23,25 @@ import pytest
 import torch
 from conftest import FakeQFLib
 
+import quantfunc.accelerate.serving as acc_serving_mod
 import quantfunc.core.lora as lora_mod
 import quantfunc.pipelines.serving as serving_pipe_mod
 from quantfunc import (
     UNSET,
+    FlowMatchResMultistepScheduler,
     MultiStageRunner,
     ServingPipeline,
     SolConfig,
     StageSpec,
+    load_krea2_pipeline,
+    load_ltx25_pipeline,
+    load_minimax_h3_pipeline,
+    load_qwenimage21_pipeline,
 )
 from quantfunc.models.krea2 import QuantFuncKrea2Transformer2DModel
 from quantfunc.models.ltx25 import QuantFuncLTX25Transformer3DModel
 from quantfunc.models.minimax_h3 import QuantFuncMiniMaxH3Transformer3DModel
+from quantfunc.pipelines._common import finalize_pipeline_load
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -681,3 +688,284 @@ def test_mutation_m10_serving_pipeline_isolation_and_security(tmp_path: Path) ->
             srv_b_ok.generate("unreg", overrides={"loras": [str(unreg_lora)]})
     finally:
         srv_b_ok.close()
+
+
+# ── Tests 53-54: L4 default res_multistep loaders & online sampler switching ─
+
+
+def test_finalize_pipeline_load_and_four_loaders_scheduler_defaults(tmp_path: Path) -> None:
+    pytest.importorskip("diffusers")
+    import warnings
+
+    from diffusers import FlowMatchEulerDiscreteScheduler
+
+    ckpt = _make_dummy_ckpt(tmp_path / "krea2-sched-def.safetensors")
+    xfm = QuantFuncKrea2Transformer2DModel.from_pretrained(ckpt, lib=FakeQFLib(), torch_dtype=torch.float32)
+    try:
+        # (1) finalize_pipeline_load default="res_multistep" converts BEFORE attach_session_hooks
+        pipe_def = SimpleNamespace(
+            transformer=xfm,
+            scheduler=FlowMatchEulerDiscreteScheduler(shift=3.0),
+        )
+        finalize_pipeline_load(pipe_def)
+        assert isinstance(pipe_def.scheduler, FlowMatchResMultistepScheduler)
+        assert pipe_def.scheduler.sampler_mode == "res_multistep"
+        assert pipe_def.scheduler.shift == pytest.approx(3.0)
+        # Session hooks MUST be attached to the newly converted FlowMatchResMultistepScheduler!
+        assert "set_timesteps" in pipe_def.scheduler.__dict__
+        assert "step" in pipe_def.scheduler.__dict__
+
+        # (2) scheduler="keep" and scheduler=None keep FlowMatchEulerDiscreteScheduler untouched
+        for keep_val in ("keep", None):
+            orig = FlowMatchEulerDiscreteScheduler(shift=2.0)
+            p_keep = SimpleNamespace(transformer=xfm, scheduler=orig)
+            finalize_pipeline_load(p_keep, scheduler=keep_val, attach_hooks=False)
+            assert p_keep.scheduler is orig
+            assert not isinstance(p_keep.scheduler, FlowMatchResMultistepScheduler)
+
+        # (3) scheduler="euler" sets sampler_mode="euler" on FlowMatchResMultistepScheduler,
+        #     and leaves FlowMatchEulerDiscreteScheduler untouched
+        res_sched = FlowMatchResMultistepScheduler(shift=2.0)
+        p_res_to_euler = SimpleNamespace(transformer=xfm, scheduler=res_sched)
+        finalize_pipeline_load(p_res_to_euler, scheduler="euler", attach_hooks=False)
+        assert p_res_to_euler.scheduler is res_sched
+        assert res_sched.sampler_mode == "euler"
+
+        orig_euler = FlowMatchEulerDiscreteScheduler(shift=2.0)
+        p_euler = SimpleNamespace(transformer=xfm, scheduler=orig_euler)
+        finalize_pipeline_load(p_euler, scheduler="euler", attach_hooks=False)
+        assert p_euler.scheduler is orig_euler
+
+        # (4) Non-FlowMatch dummy scheduler left untouched under default scheduler="res_multistep"
+        dummy_sched = _DummySched()
+        p_dummy = SimpleNamespace(transformer=xfm, scheduler=dummy_sched)
+        finalize_pipeline_load(p_dummy, attach_hooks=False)
+        assert p_dummy.scheduler is dummy_sched
+
+        # (5) Invalid scheduler value rejected fail-closed
+        for bad_sched in ("dpmpp", "", 123, True):
+            with pytest.raises(ValueError, match="Unsupported scheduler"):
+                finalize_pipeline_load(
+                    SimpleNamespace(transformer=xfm, scheduler=FlowMatchEulerDiscreteScheduler()),
+                    scheduler=bad_sched,  # type: ignore[arg-type]
+                )
+
+        # (6) All 4 model pipeline loaders default to FlowMatchResMultistepScheduler & respect scheduler=
+        class _FakeFlowPipe:
+            @classmethod
+            def from_pretrained(cls, model_id: str, transformer: Any, **kw: Any) -> Any:
+                del model_id, kw
+                return SimpleNamespace(
+                    transformer=transformer,
+                    scheduler=FlowMatchEulerDiscreteScheduler(shift=2.5, stochastic_sampling=True),
+                )
+
+        for loader in (
+            load_krea2_pipeline,
+            load_qwenimage21_pipeline,
+            load_ltx25_pipeline,
+            load_minimax_h3_pipeline,
+        ):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                p_loaded = loader("org/model", transformer=xfm, pipeline_cls=_FakeFlowPipe)
+            assert isinstance(p_loaded.scheduler, FlowMatchResMultistepScheduler)
+            assert p_loaded.scheduler.shift == pytest.approx(2.5)
+            assert p_loaded.scheduler.sampler_mode == "res_multistep"
+            assert "set_timesteps" in p_loaded.scheduler.__dict__
+            if loader is load_ltx25_pipeline:
+                assert p_loaded.scheduler.config.stochastic_sampling is False
+
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                p_kept = loader("org/model", transformer=xfm, pipeline_cls=_FakeFlowPipe, scheduler="keep")
+            assert not isinstance(p_kept.scheduler, FlowMatchResMultistepScheduler)
+    finally:
+        xfm.close()
+
+
+def test_serving_pipeline_and_http_online_sampler_switching_and_rollback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("diffusers")
+
+    ckpt = _make_dummy_ckpt(tmp_path / "krea2-sampler-srv.safetensors")
+    xfm = QuantFuncKrea2Transformer2DModel.from_pretrained(ckpt, lib=FakeQFLib(), torch_dtype=torch.float32)
+
+    class _SamplerPipe:
+        def __init__(self) -> None:
+            self.transformer = xfm
+            self.scheduler = FlowMatchResMultistepScheduler()
+            self.scheduler.set_timesteps(4)
+            self.raise_on_call: bool = False
+
+        def __call__(self, **kw: Any) -> dict[str, Any]:
+            # Populate multistep history during request to verify cleanup on exception
+            self.scheduler.set_timesteps(4)
+            self.scheduler.step(
+                torch.ones(1, 2, 4, 4),
+                self.scheduler.timesteps[0],
+                torch.ones(1, 2, 4, 4),
+                return_dict=False,
+            )
+            if self.raise_on_call:
+                raise RuntimeError("gen_failed_mid_loop")
+            return {
+                "prompt": kw.get("prompt"),
+                "sampler_mode": self.scheduler.sampler_mode,
+            }
+
+    pipe = _SamplerPipe()
+    server = ServingPipeline(pipe, busy_timeout=1.0)
+    try:
+        # (1) Default mode is res_multistep; status() reports it
+        assert server.status()["sampler_mode"] == "res_multistep"
+        r_def = server.generate("default")
+        assert r_def["sampler_mode"] == "res_multistep"
+        assert pipe.scheduler.sampler_mode == "res_multistep"
+        assert pipe.scheduler._old_denoised is None
+
+        # (2) Per-request sampler="euler" via top-level arg & via overrides={"sampler": "euler"} + atomic restore
+        r_euler = server.generate("fast", sampler="euler")
+        assert r_euler["sampler_mode"] == "euler"
+        assert pipe.scheduler.sampler_mode == "res_multistep"
+
+        r_ov = server.generate("fast_ov", overrides={"sampler": "euler"})
+        assert r_ov["sampler_mode"] == "euler"
+        assert pipe.scheduler.sampler_mode == "res_multistep"
+
+        # Async agenerate switching & restore
+        r_async = asyncio.run(server.agenerate("async_euler", sampler="euler"))
+        assert r_async["sampler_mode"] == "euler"
+        assert pipe.scheduler.sampler_mode == "res_multistep"
+
+        # (3) Exception rollback: sampler_mode restored to "res_multistep" AND history cleared!
+        pipe.raise_on_call = True
+        with pytest.raises(RuntimeError, match="gen_failed_mid_loop"):
+            server.generate("boom", sampler="euler")
+        pipe.raise_on_call = False
+        assert pipe.scheduler.sampler_mode == "res_multistep"
+        assert pipe.scheduler._old_denoised is None
+
+        # (4) MultiStageRunner per-stage sampler override & restoration
+        stage_modes: list[str] = []
+
+        def _stage_rec(p: Any, _s: StageSpec, _b: Any, kw: dict[str, Any]) -> Any:
+            stage_modes.append(p.scheduler.sampler_mode)
+            return p(**kw)
+
+        stages = [
+            StageSpec(name="s1", num_inference_steps=2, output_type="latent", stage_call_adapter=_stage_rec),
+            StageSpec(
+                name="s2",
+                num_inference_steps=2,
+                transformer_overrides={"sampler": "euler"},
+                stage_call_adapter=_stage_rec,
+            ),
+        ]
+        server.generate("staged", stages=stages)
+        assert stage_modes == ["res_multistep", "euler"]
+        assert pipe.scheduler.sampler_mode == "res_multistep"
+
+        # (5) Pre-lock validation: invalid sampler & conflicting sampler raise ValueError BEFORE acquiring lock
+        held = threading.Event()
+        release = threading.Event()
+
+        def _hold() -> None:
+            with server.lock:
+                held.set()
+                release.wait(timeout=5.0)
+
+        t_hold = threading.Thread(target=_hold)
+        t_hold.start()
+        assert held.wait(timeout=2.0)
+        try:
+            with pytest.raises(ValueError, match="sampler"):
+                server.generate("bad", sampler="dpmpp", busy_timeout=0.0)
+            with pytest.raises(ValueError, match="Conflicting sampler"):
+                server.generate(
+                    "conflict",
+                    sampler="euler",
+                    overrides={"sampler": "res_multistep"},
+                    busy_timeout=0.0,
+                )
+        finally:
+            release.set()
+            t_hold.join(timeout=5.0)
+
+        # (6) HTTP controller + stdlib + FastAPI sampler wiring (pos & neg)
+        ex = _load_http_example()
+        httpd = ex.build_stdlib_server(server, host="127.0.0.1", port=0)
+        base_url = f"http://127.0.0.1:{httpd.server_address[1]}"
+        th = threading.Thread(target=httpd.serve_forever, daemon=True)
+        th.start()
+        try:
+            code, r1 = _http_json(base_url, "POST", "/v1/generate", {"prompt": "h1"})
+            assert code == 200 and r1["result"]["sampler_mode"] == "res_multistep"
+
+            code, r2 = _http_json(base_url, "POST", "/v1/generate", {"prompt": "h2", "sampler": "euler"})
+            assert code == 200 and r2["result"]["sampler_mode"] == "euler"
+            assert pipe.scheduler.sampler_mode == "res_multistep"
+
+            code, r3 = _http_json(base_url, "POST", "/v1/generate", {"prompt": "h3", "sampler": None})
+            assert code == 200 and r3["result"]["sampler_mode"] == "res_multistep"
+
+            code, r4 = _http_json(
+                base_url,
+                "POST",
+                "/v1/generate",
+                {"prompt": "h4", "overrides": {"sampler": "euler"}},
+            )
+            assert code == 200 and r4["result"]["sampler_mode"] == "euler"
+
+            # Negative controls: invalid sampler, conflicting sampler, extra_kwargs smuggling -> 400
+            for bad_body in (
+                {"prompt": "bad", "sampler": "bogus"},
+                {"prompt": "bad", "sampler": "euler", "overrides": {"sampler": "res_multistep"}},
+                {"prompt": "bad", "extra_kwargs": {"sampler": "euler"}},
+            ):
+                code, _ = _http_json(base_url, "POST", "/v1/generate", bad_body)
+                assert code == 400, f"Expected 400 for {bad_body!r}, got {code}"
+
+            if ex.HAS_FASTAPI:
+                try:
+                    from fastapi.testclient import TestClient
+
+                    client = TestClient(ex.build_app(server))
+                    assert client.post("/v1/generate", json={"prompt": "fa", "sampler": "euler"}).json()["result"]["sampler_mode"] == "euler"
+                    assert pipe.scheduler.sampler_mode == "res_multistep"
+                    assert client.post("/v1/generate", json={"prompt": "fa", "sampler": "bogus"}).status_code == 422
+                except ImportError:
+                    pass
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+        # (7) Mutation arm M11: skipping restore_runtime_overrides on exception MUST leak sampler_mode="euler" -> RED!
+        pipe.raise_on_call = True
+        with monkeypatch.context() as mp:
+            mp.setattr(acc_serving_mod, "restore_runtime_overrides", lambda _saved: None)
+            with pytest.raises(RuntimeError, match="gen_failed_mid_loop"):
+                server.generate("mut_leak", sampler="euler")
+            with pytest.raises(AssertionError):
+                assert pipe.scheduler.sampler_mode == "res_multistep"
+        # Restore baseline & verify green control
+        pipe.scheduler.sampler_mode = "res_multistep"
+        with pytest.raises(RuntimeError, match="gen_failed_mid_loop"):
+            server.generate("ctrl_ok", sampler="euler")
+        pipe.raise_on_call = False
+        assert pipe.scheduler.sampler_mode == "res_multistep"
+    finally:
+        server.close()
+
+    # (8) Scheduler without sampler_mode (plain _DummySched) handles sampler="euler" gracefully
+    xfm2 = QuantFuncKrea2Transformer2DModel.from_pretrained(ckpt, lib=FakeQFLib(), torch_dtype=torch.float32)
+    srv_plain = ServingPipeline(_WarmRecordPipe(xfm2))
+    try:
+        assert srv_plain.status()["sampler_mode"] is None
+        res_plain = srv_plain.generate("plain_sched", sampler="euler")
+        assert res_plain["kwargs"]["prompt"] == "plain_sched"
+    finally:
+        srv_plain.close()
+

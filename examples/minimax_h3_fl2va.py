@@ -1,7 +1,8 @@
 """MiniMax-H3 first/last keyframe audio-video generation (FL2VA).
 
-Demonstrates ``set_av_conditions(keyframes=...)`` with clean VAE-encoded keyframe
-latents and automatic data-direction adaptation with ``MiniMaxH3ModularPipeline``.
+Uses ``FlowMatchResMultistepScheduler`` by default via ``load_minimax_h3_pipeline``,
+demonstrates ``set_av_conditions(keyframes=...)`` with clean VAE-encoded keyframe
+latents, and automatic data-direction adaptation with ``MiniMaxH3ModularPipeline``.
 """
 
 from __future__ import annotations

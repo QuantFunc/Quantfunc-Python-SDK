@@ -372,6 +372,7 @@ def load_ltx25_pipeline(
     offload_mode: str | None = None,
     attach_hooks: bool = True,
     deterministic_scheduler: bool = True,
+    scheduler: str | None = "res_multistep",
     pipeline_cls: Any | None = None,
     **kwargs: Any,
 ) -> Any:
@@ -402,4 +403,9 @@ def load_ltx25_pipeline(
 
     if deterministic_scheduler:
         ensure_deterministic_scheduler(pipe)
-    return finalize_pipeline_load(pipe, attach_hooks=attach_hooks, offload=offload_mode)
+    return finalize_pipeline_load(
+        pipe,
+        attach_hooks=attach_hooks,
+        offload=offload_mode,
+        scheduler=scheduler,
+    )

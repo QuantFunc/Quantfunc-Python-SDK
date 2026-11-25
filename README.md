@@ -5,6 +5,7 @@ Drop-in, layered Python acceleration runtime for image, video, and audio-video d
 - **Pure-Python wheel (`py3-none-any`)**: only requires `torch>=2.4`; optional extras for `diffusers`, `transformers`, HuggingFace Hub, and ModelScope.
 - **1–3 line drop-in**: replace a pipeline's `transformer` with a `QuantFunc*Transformer` and keep the rest of your `diffusers` workflow intact.
 - **Zero-boilerplate session management**: automatic Tier-1 scheduler hooks (`attach_session_hooks`) and Tier-2 fallback tracking, without mutating `pipe.__class__`.
+- **ComfyUI-aligned `res_multistep` default**: drop-in `FlowMatchResMultistepScheduler` (2nd-order exponential multistep, `eta=0.0`) enabled automatically by all pipeline loaders (`scheduler="res_multistep"` by default, with `scheduler="euler"` / `"keep"` and zero-cost online per-request switching via `sampler="euler" | "res_multistep"`).
 - **Automatic native engine lifecycle**: zero-config install on first load, non-blocking background update checks with offline fallback, SHA-256 verification, and atomic rollback.
 - **Model-agnostic multi-stage sampling**: generic `MultiStageRunner` for 2-stage and N-stage workflows, plus thin presets for Krea-2, Qwen-Image-2.1, LTX-2.5 AV, and MiniMax-H3 AV.
 
@@ -138,7 +139,7 @@ L0: quantfunc.native                           Frozen C-API bindings, secure ins
 | **L0** | `quantfunc.native` | 25-symbol C-API, typed error hierarchy, HTTPS/SHA-256 installer & updater, RAII engine handle |
 | **L1** | `quantfunc.core` | Model-agnostic `SolConfig`, `EngineConfig`, `RuntimeOverrides`, `AutoSessionTracker`, pure-stdlib LoRA converter & O(1) cache, preset metadata, `@register_model` |
 | **L2** | `quantfunc.models` | `QuantFuncBaseTransformer` (meta/offload safe, per-request state reset) and Krea-2, Qwen-Image-2.1, LTX-2.5, MiniMax-H3 adapters |
-| **L3** | `quantfunc.accelerate`, `quantfunc.sampling` | Instance-level scheduler hooks (`pipe.__class__` untouched), `request_scope` serving lock & override engine, generic `MultiStageRunner` |
+| **L3** | `quantfunc.accelerate`, `quantfunc.sampling` | Instance-level scheduler hooks (`pipe.__class__` untouched), `request_scope` serving lock & override engine, `FlowMatchResMultistepScheduler` / `use_res_multistep_scheduler`, generic `MultiStageRunner` |
 | **L4** | `quantfunc.pipelines`, `quantfunc.cli` | Model-specific pipeline loaders, two-stage factories, model-agnostic `ServingPipeline`, Qwen3-VL pre-norm helper, `quantfunc` CLI |
 
 ---
@@ -207,9 +208,27 @@ runner = MultiStageRunner([
 result = runner.run(pipe, prompt="a botanical greenhouse at golden hour")
 ```
 
+### Default `res_multistep` Sampler (ComfyUI Parity)
+
+All SDK pipeline loaders (`load_krea2_pipeline`, `load_qwenimage21_pipeline`, `load_ltx25_pipeline`, `load_minimax_h3_pipeline`) automatically upgrade `FlowMatchEulerDiscreteScheduler` to `FlowMatchResMultistepScheduler` (`scheduler="res_multistep"` by default), matching ComfyUI's deterministic `sample_res_multistep` (`eta=0.0`) while remaining a drop-in `FlowMatchEulerDiscreteScheduler` subclass:
+
+```python
+from quantfunc import load_krea2_pipeline, use_res_multistep_scheduler
+
+# Default: automatic FlowMatchResMultistepScheduler (preserves shift / dynamic shifting)
+pipe = load_krea2_pipeline("krea/krea-2", transformer_path="/path/to/krea2-quantfunc.safetensors")
+
+# Opt out or pick Euler at load time (never hardcoded)
+pipe_euler = load_krea2_pipeline("krea/krea-2", transformer_path="...", scheduler="euler")
+pipe_orig = load_krea2_pipeline("krea/krea-2", transformer_path="...", scheduler="keep")
+
+# Or upgrade any existing diffusers FlowMatch pipeline manually (idempotent)
+use_res_multistep_scheduler(existing_pipe)
+```
+
 ### Online HTTP Serving & Per-Request Parameter Switching
 
-Keep a single warm pipeline resident in GPU memory and switch prompts, multimodal conditions (`image`, `video`, `audio`, `mask`, `ref_audio`, `av_conditions`, `ref_latents`, `image_slots`), acceleration dials (`sol`, `loras`, `quality_enhance`, `fbcache`/`block_cache`, `stepcache`/`step_cache`, `attention_backend`, `default_steps`), and single-stage vs multi-stage workflows per request with zero base-weight reloads:
+Keep a single warm pipeline resident in GPU memory and switch prompts, multimodal conditions (`image`, `video`, `audio`, `mask`, `ref_audio`, `av_conditions`, `ref_latents`, `image_slots`), acceleration dials (`sol`, `loras`, `quality_enhance`, `fbcache`/`block_cache`, `stepcache`/`step_cache`, `attention_backend`, `default_steps`, `sampler`), and single-stage vs multi-stage workflows per request with zero base-weight reloads:
 
 ```python
 from quantfunc import ServingPipeline
@@ -244,8 +263,8 @@ out2 = server.generate(
     stages=two_stage_specs,
 )
 
-# Request 3: omitting loras resets to default_loras (empty by default, preventing cross-request leakage)
-out3 = server.generate("minimal desert dunes", overrides={"sol": None})
+# Request 3: omitting loras resets to default_loras; switch sampler per-request without reloading
+out3 = server.generate("minimal desert dunes", sampler="euler", overrides={"sol": None})
 
 # Async serving & non-blocking health/status inspection (never exposes host root directories)
 out4 = await server.agenerate("starry observatory")

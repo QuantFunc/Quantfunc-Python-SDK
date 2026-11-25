@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import copy
 import json
+import math
+import os
 import struct
+import subprocess
+import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,6 +32,10 @@ from quantfunc.core.sol import SolConfig
 from quantfunc.models.krea2 import QuantFuncKrea2Transformer2DModel
 from quantfunc.sampling.bundle import LatentBundle
 from quantfunc.sampling.renoise import FlowMatchRenoise
+from quantfunc.sampling.res_multistep import (
+    FlowMatchResMultistepScheduler,
+    use_res_multistep_scheduler,
+)
 from quantfunc.sampling.runner import MultiStageRunner, StageResult, StageSpec, run_stages
 from quantfunc.sampling.sigmas import build_linear_sigmas, denoise_sigmas, split_sigmas
 from quantfunc.sampling.upscalers import (
@@ -1372,8 +1380,8 @@ def test_mutation_m9_request_scope_invariants(monkeypatch: pytest.MonkeyPatch, t
 
 
 def test_apply_runtime_overrides_multi_transformer_atomic_rollback_sticky_loras(tmp_path: Path) -> None:
-    """Mid-apply failure on a second transformer must atomically roll back transformer 1 (incl. sticky LoRAs)."""
-    from quantfunc.accelerate.serving import apply_runtime_overrides
+    """Mid-apply failure on a second transformer must atomically roll back transformer 1, sticky LoRAs, and scheduler sampler_mode."""
+    from quantfunc.accelerate.serving import apply_runtime_overrides, request_scope
     from quantfunc.core.overrides import RuntimeOverrides
 
     lora_a = _make_dummy_lora_safetensors(tmp_path / "rb_a.safetensors", val=1.0)
@@ -1381,7 +1389,8 @@ def test_apply_runtime_overrides_multi_transformer_atomic_rollback_sticky_loras(
     ckpt2 = _make_dummy_krea2_ckpt(tmp_path / "krea_rb2.safetensors")
     t1 = QuantFuncKrea2Transformer2DModel.from_pretrained(ckpt1, lib=FakeQFLib(), torch_dtype=torch.float32)
     t2 = QuantFuncKrea2Transformer2DModel.from_pretrained(ckpt2, lib=FakeQFLib(), torch_dtype=torch.float32)
-    pipe = SimpleNamespace(transformer=t1, transformer_2=t2)
+    sched = FlowMatchResMultistepScheduler()
+    pipe = SimpleNamespace(transformer=t1, transformer_2=t2, scheduler=sched)
     try:
         orig_set_loras = t2.set_loras
 
@@ -1389,6 +1398,7 @@ def test_apply_runtime_overrides_multi_transformer_atomic_rollback_sticky_loras(
             raise RuntimeError("t2_lora_bind_failed")
 
         t2.set_loras = _boom_loras  # type: ignore[method-assign]
+        assert sched.sampler_mode == "res_multistep"
         with pytest.raises(RuntimeError, match="t2_lora_bind_failed"):
             apply_runtime_overrides(
                 pipe,
@@ -1398,11 +1408,14 @@ def test_apply_runtime_overrides_multi_transformer_atomic_rollback_sticky_loras(
                         "fbcache": 0.08,
                         "sol": {"enabled": True, "tau": 1.3},
                         "loras": [(str(lora_a), 0.75)],
+                        "sampler": "euler",
                     }
                 ),
                 sticky_loras=True,
             )
 
+        # Scheduler sampler_mode mutated before transformer failure must be atomically rolled back!
+        assert sched.sampler_mode == "res_multistep"
         # Transformer 1 must be completely rolled back (including sticky LoRAs and all dials)
         assert t1.quality_enhance is False
         assert t1.block_cache == pytest.approx(0.0)
@@ -1413,8 +1426,550 @@ def test_apply_runtime_overrides_multi_transformer_atomic_rollback_sticky_loras(
         assert t2.block_cache == pytest.approx(0.0)
         assert t2.sol_config is None
         t2.set_loras = orig_set_loras  # type: ignore[method-assign]
+
+        # Direct L3a request_scope(pipe, sampler=...) switching, history cleanup & conflict rejection
+        sched.set_timesteps(4)
+        with request_scope(pipe, sampler="euler"):
+            assert sched.sampler_mode == "euler"
+            sched.step(torch.ones(1, 2, 4, 4), sched.timesteps[0], torch.ones(1, 2, 4, 4), return_dict=False)
+        assert sched.sampler_mode == "res_multistep"
+        assert sched._old_denoised is None and sched._prev_sigma is None
+
+        # Normal request_scope also resets multistep history on exit and restores sampler_mode on exception
+        sched.set_timesteps(4)
+        with request_scope(pipe):
+            sched.step(torch.ones(1, 2, 4, 4), sched.timesteps[0], torch.ones(1, 2, 4, 4), return_dict=False)
+            assert sched._old_denoised is not None
+        assert sched._old_denoised is None and sched._prev_sigma is None
+
+        sched.set_timesteps(4)
+        with pytest.raises(RuntimeError, match="scope_sampler_boom"):
+            with request_scope(pipe, sampler="euler"):
+                assert sched.sampler_mode == "euler"
+                sched.step(torch.ones(1, 2, 4, 4), sched.timesteps[0], torch.ones(1, 2, 4, 4), return_dict=False)
+                raise RuntimeError("scope_sampler_boom")
+        assert sched.sampler_mode == "res_multistep"
+        assert sched._old_denoised is None and sched._prev_sigma is None
+
+        # Conflict between overrides.sampler and sampler= kwarg fails closed
+        with pytest.raises(ValueError, match="Conflicting sampler"):
+            with request_scope(pipe, {"sampler": "res_multistep"}, sampler="euler"):
+                pass
+        with pytest.raises(ValueError, match="sampler"):
+            with request_scope(pipe, sampler="invalid_mode"):
+                pass
     finally:
         t1.close()
         t2.close()
+
+
+# ── Tests 50-52: FlowMatchResMultistepScheduler parity, safety & mutations ──
+
+
+def _comfy_res_multistep_reference(
+    x_init: torch.Tensor,
+    sigmas: torch.Tensor,
+    vel_fn: Any,
+) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    """Direct independent reference matching ComfyUI sample_res_multistep (eta=0, cfg_pp=False)."""
+    x = x_init.to(dtype=torch.float32).clone()
+    t_fn = lambda s: s.log().neg()  # noqa: E731
+    sigma_fn = lambda t: t.neg().exp()  # noqa: E731
+    phi1_fn = lambda t: torch.expm1(t) / t  # noqa: E731
+    phi2_fn = lambda t: (phi1_fn(t) - 1.0) / t  # noqa: E731
+
+    old_denoised: torch.Tensor | None = None
+    old_sigma_down: torch.Tensor | None = None
+    trajectory: list[torch.Tensor] = []
+
+    for i in range(len(sigmas) - 1):
+        s = sigmas[i].to(dtype=torch.float32)
+        s_next = sigmas[i + 1].to(dtype=torch.float32)
+        v = vel_fn(x, float(s.item())).to(dtype=torch.float32)
+        denoised = x - s * v
+        if s_next == 0 or old_denoised is None:
+            d = (x - denoised) / s
+            x = x + d * (s_next - s)
+        else:
+            assert old_sigma_down is not None
+            t = t_fn(s)
+            t_old = t_fn(old_sigma_down)
+            t_next = t_fn(s_next)
+            t_prev = t_fn(sigmas[i - 1].to(dtype=torch.float32))
+            h = t_next - t
+            c2 = (t_prev - t_old) / h
+            phi1_val, phi2_val = phi1_fn(-h), phi2_fn(-h)
+            b1 = torch.nan_to_num(phi1_val - phi2_val / c2, nan=0.0)
+            b2 = torch.nan_to_num(phi2_val / c2, nan=0.0)
+            x = sigma_fn(h) * x + h * (b1 * denoised + b2 * old_denoised)
+        old_denoised = denoised
+        old_sigma_down = s_next
+        trajectory.append(x.clone())
+    return x, trajectory
+
+
+def test_res_multistep_exact_parity_and_flow_invariants() -> None:
+    diffusers = pytest.importorskip("diffusers")
+    from diffusers import FlowMatchEulerDiscreteScheduler
+
+    _ = diffusers
+
+    # (1) Exact numerical parity (< 1e-6) vs independent ComfyUI res_multistep reference on 6-step schedule
+    schedule_sigmas = [1.0, 0.85, 0.65, 0.45, 0.25, 0.1]
+    sigmas_tensor = torch.tensor([*schedule_sigmas, 0.0], dtype=torch.float32)
+    gen = torch.Generator().manual_seed(1234)
+    x0_init = torch.randn(1, 4, 8, 8, generator=gen, dtype=torch.float32)
+
+    def _nonlinear_vel(x: torch.Tensor, sigma: float) -> torch.Tensor:
+        return 0.7 * x - 0.35 * torch.sin(x) + 0.2 * sigma
+
+    ref_final, ref_traj = _comfy_res_multistep_reference(x0_init, sigmas_tensor, _nonlinear_vel)
+
+    sched = FlowMatchResMultistepScheduler()
+    assert isinstance(sched, FlowMatchEulerDiscreteScheduler)
+    assert sched.sampler_mode == "res_multistep"
+    sched.set_timesteps(sigmas=schedule_sigmas)
+    assert len(sched.timesteps) == 6
+    assert len(sched.sigmas) == 7
+
+    x = x0_init.clone()
+    for i, t in enumerate(sched.timesteps):
+        v = _nonlinear_vel(x, float(sched.sigmas[i].item()))
+        out = sched.step(v, t, x, return_dict=True)
+        assert hasattr(out, "prev_sample")
+        x = out.prev_sample
+        assert sched.step_index == i + 1
+        max_err = (x - ref_traj[i]).abs().max().item()
+        assert max_err < 1e-6, f"Step {i} parity error {max_err} >= 1e-6"
+        if i < len(sched.timesteps) - 1:
+            assert sched._old_denoised is not None
+            assert sched._prev_sigma == pytest.approx(schedule_sigmas[i])
+        else:
+            # Terminal step (sigma_next == 0) frees cached history tensor
+            assert sched._old_denoised is None
+            assert sched._prev_sigma is None
+
+    assert (x - ref_final).abs().max().item() < 1e-6
+
+    # (2) sampler_mode="euler" matches diffusers FlowMatchEulerDiscreteScheduler (< 1e-6)
+    #     and diverges meaningfully (> 1e-2) from 2nd-order res_multistep on nonlinear velocity
+    sched.sampler_mode = "euler"
+    sched.set_timesteps(sigmas=schedule_sigmas)
+    euler_ref = FlowMatchEulerDiscreteScheduler()
+    euler_ref.set_timesteps(sigmas=schedule_sigmas)
+
+    x_mode_euler = x0_init.clone()
+    x_ref_euler = x0_init.clone()
+    for i, (t1, t2) in enumerate(zip(sched.timesteps, euler_ref.timesteps, strict=True)):
+        v1 = _nonlinear_vel(x_mode_euler, float(sched.sigmas[i].item()))
+        v2 = _nonlinear_vel(x_ref_euler, float(euler_ref.sigmas[i].item()))
+        x_mode_euler = sched.step(v1, t1, x_mode_euler, return_dict=False)[0]
+        x_ref_euler = euler_ref.step(v2, t2, x_ref_euler, return_dict=False)[0]
+        assert sched.step_index == euler_ref.step_index == i + 1
+        assert sched._old_denoised is None
+        assert sched._prev_sigma is None
+
+    assert (x_mode_euler - x_ref_euler).abs().max().item() < 1e-6
+    assert (ref_final - x_ref_euler).abs().max().item() > 1e-2
+
+    # (3) Constant-x0 flow-matching invariant: x_t = (1 - sigma) * x0 + sigma * eps -> exact recovery (< 1e-6)
+    x_clean = torch.randn(1, 4, 8, 8, generator=gen, dtype=torch.float32)
+    eps = torch.randn(1, 4, 8, 8, generator=gen, dtype=torch.float32)
+    v_const = eps - x_clean
+
+    sched_inv = FlowMatchResMultistepScheduler()
+    sched_inv.set_timesteps(sigmas=build_linear_sigmas(6, shift=3.0)[:-1])
+    sigma0 = float(sched_inv.sigmas[0].item())
+    x_flow = (1.0 - sigma0) * x_clean + sigma0 * eps
+    for i, t in enumerate(sched_inv.timesteps):
+        x_flow = sched_inv.step(v_const, t, x_flow, return_dict=False)[0]
+        s_next = float(sched_inv.sigmas[i + 1].item())
+        expected_next = (1.0 - s_next) * x_clean + s_next * eps
+        assert (x_flow - expected_next).abs().max().item() < 1e-6
+    assert (x_flow - x_clean).abs().max().item() < 1e-6
+
+    # Also verify constant-x0 invariant under diffusers default shift=3.0 linspace-to-0.001 schedule
+    sched_inv_def = FlowMatchResMultistepScheduler(shift=3.0)
+    sched_inv_def.set_timesteps(6)
+    s0_def = float(sched_inv_def.sigmas[0].item())
+    x_flow_def = (1.0 - s0_def) * x_clean + s0_def * eps
+    for i, t in enumerate(sched_inv_def.timesteps):
+        x_flow_def = sched_inv_def.step(v_const, t, x_flow_def, return_dict=False)[0]
+        s_next = float(sched_inv_def.sigmas[i + 1].item())
+        expected_next = (1.0 - s_next) * x_clean + s_next * eps
+        assert torch.allclose(x_flow_def, expected_next, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(x_flow_def, x_clean, atol=1e-5, rtol=1e-5)
+
+    # (4) bfloat16 dtype preservation (internal fp32 computation, cast back to sample.dtype)
+    sched_bf16 = FlowMatchResMultistepScheduler()
+    sched_bf16.set_timesteps(sigmas=schedule_sigmas)
+    x_bf = x0_init.to(dtype=torch.bfloat16)
+    for i, t in enumerate(sched_bf16.timesteps):
+        v_bf = _nonlinear_vel(x_bf.float(), float(sched_bf16.sigmas[i].item())).to(dtype=torch.bfloat16)
+        x_bf = sched_bf16.step(v_bf, t, x_bf, return_dict=False)[0]
+        assert x_bf.dtype == torch.bfloat16
+        assert torch.isfinite(x_bf).all()
+
+    # (5) Small-h Taylor stability & duplicate-sigma Euler fallback (zero NaN/Inf)
+    sched_edge = FlowMatchResMultistepScheduler()
+    sched_edge.set_timesteps(sigmas=[1.0, 0.999999, 0.999999, 0.5])
+    x_e = x0_init.clone()
+    for i, t in enumerate(sched_edge.timesteps):
+        v_e = _nonlinear_vel(x_e, float(sched_edge.sigmas[i].item()))
+        x_e = sched_edge.step(v_e, t, x_e, return_dict=False)[0]
+        assert torch.isfinite(x_e).all()
+
+    # (6) Validation & negative inputs: invalid sampler_mode, integer timestep
+    for bad_mode in ("ddim", "", None, 123, True):
+        with pytest.raises(ValueError, match="sampler_mode"):
+            FlowMatchResMultistepScheduler(sampler_mode=bad_mode)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="sampler_mode"):
+            sched.sampler_mode = bad_mode  # type: ignore[assignment]
+
+    sched.sampler_mode = "res_multistep"
+    sched.set_timesteps(4)
+    with pytest.raises(ValueError, match="integer indices"):
+        sched.step(x0_init, 0, x0_init)
+    with pytest.raises(ValueError, match="integer indices"):
+        sched.step(x0_init, torch.tensor(0, dtype=torch.long), x0_init)
+
+    # (7) from_config + dynamic shifting + per_token_timesteps delegation
+    base_dyn = FlowMatchEulerDiscreteScheduler(
+        shift=2.5,
+        use_dynamic_shifting=True,
+        shift_terminal=0.02,
+        base_shift=0.5,
+        max_shift=1.15,
+    )
+    cloned_cfg = FlowMatchResMultistepScheduler.from_config(base_dyn.config)
+    assert cloned_cfg.shift == pytest.approx(2.5)
+    assert cloned_cfg.config.use_dynamic_shifting is True
+    assert cloned_cfg.config.shift_terminal == pytest.approx(0.02)
+    cloned_cfg.set_timesteps(4, mu=0.8)
+    base_dyn.set_timesteps(4, mu=0.8)
+    assert torch.allclose(cloned_cfg.sigmas, base_dyn.sigmas)
+
+    # per_token_timesteps delegates cleanly and clears multistep history
+    sched_pt = FlowMatchResMultistepScheduler()
+    sched_pt.set_timesteps(4)
+    sample_pt = torch.randn(1, 6, 4, dtype=torch.float32)
+    vel_pt = torch.randn_like(sample_pt)
+    pt_ts = torch.full((1, 6), float(sched_pt.timesteps[0].item()), dtype=torch.float32)
+    out_pt = sched_pt.step(vel_pt, sched_pt.timesteps[0], sample_pt, per_token_timesteps=pt_ts, return_dict=False)[0]
+    assert out_pt.shape == sample_pt.shape and torch.isfinite(out_pt).all()
+    assert sched_pt.step_index == 1
+    assert sched_pt._old_denoised is None
+
+    # (8) stochastic_sampling=True clears history and delegates cleanly to super().step
+    sched_stoch = FlowMatchResMultistepScheduler(stochastic_sampling=True)
+    sched_stoch.set_timesteps(4)
+    sched_stoch._old_denoised = torch.ones_like(x0_init)
+    sched_stoch._prev_sigma = 1.0
+    out_stoch = sched_stoch.step(
+        torch.randn_like(x0_init),
+        sched_stoch.timesteps[0],
+        x0_init,
+        return_dict=True,
+    )
+    assert hasattr(out_stoch, "prev_sample")
+    assert out_stoch.prev_sample.shape == x0_init.shape
+    assert torch.isfinite(out_stoch.prev_sample).all()
+    assert sched_stoch.step_index == 1
+    assert sched_stoch._old_denoised is None and sched_stoch._prev_sigma is None
+
+    # (9) invert_sigmas=True falls back cleanly to Euler matching FlowMatchEulerDiscreteScheduler
+    sched_inv_sig = FlowMatchResMultistepScheduler(invert_sigmas=True)
+    euler_inv_sig = FlowMatchEulerDiscreteScheduler(invert_sigmas=True)
+    sched_inv_sig.set_timesteps(4)
+    euler_inv_sig.set_timesteps(4)
+    x_inv = x0_init.clone()
+    x_inv_ref = x0_init.clone()
+    for i, (t1, t2) in enumerate(zip(sched_inv_sig.timesteps, euler_inv_sig.timesteps, strict=True)):
+        v1 = _nonlinear_vel(x_inv, float(sched_inv_sig.sigmas[i].item()))
+        v2 = _nonlinear_vel(x_inv_ref, float(euler_inv_sig.sigmas[i].item()))
+        x_inv = sched_inv_sig.step(v1, t1, x_inv, return_dict=False)[0]
+        x_inv_ref = euler_inv_sig.step(v2, t2, x_inv_ref, return_dict=False)[0]
+        assert torch.isfinite(x_inv).all()
+    assert (x_inv - x_inv_ref).abs().max().item() < 1e-6
+
+
+def test_res_multistep_safety_invariants_deepcopy_hooks_and_pure_torch_fallback(tmp_path: Path) -> None:
+    pytest.importorskip("diffusers")
+
+    # (1) copy.deepcopy isolates multistep history & unwraps attach_session_hooks cleanly
+    ckpt = _make_dummy_krea2_ckpt(tmp_path / "krea2-res-hooks.safetensors")
+    lib = FakeQFLib()
+    xfm = QuantFuncKrea2Transformer2DModel.from_pretrained(ckpt, lib=lib, torch_dtype=torch.float32)
+    sched = FlowMatchResMultistepScheduler()
+    pipe = SimpleNamespace(
+        transformer=xfm,
+        scheduler=sched,
+        guidance_scale=1.0,
+        do_classifier_free_guidance=False,
+        interrupt=False,
+    )
+    attach_session_hooks(pipe)
+    try:
+        pipe.scheduler.set_timesteps(6)
+        assert xfm._staged_schedule is not None and xfm._staged_schedule.num_steps == 6
+        ctx = torch.randn(1, 4, 2560, dtype=torch.float32)
+        lat = torch.randn(1, 64, 2, 2, dtype=torch.float32)
+
+        # Step 0 populates primary history
+        t0 = pipe.scheduler.timesteps[0]
+        vel0 = xfm(lat, encoder_hidden_states=ctx, timestep=t0).sample
+        lat = pipe.scheduler.step(vel0, t0, lat, return_dict=False)[0]
+        assert pipe.scheduler._old_denoised is not None
+        assert pipe.scheduler._prev_sigma is not None
+        assert lib.sessions[-1]["ended"] is False
+
+        # Deepcopy mid-run: clone gets fresh None history and does NOT trigger primary hooks!
+        audio_sched = copy.deepcopy(pipe.scheduler)
+        assert audio_sched._old_denoised is None
+        assert audio_sched._prev_sigma is None
+        assert pipe.scheduler._old_denoised is not None  # original untouched!
+
+        sessions_before = len(lib.sessions)
+        audio_sched.set_timesteps(3)
+        audio_lat = torch.randn(1, 8, 4, 4, dtype=torch.float32)
+        for ta in audio_sched.timesteps:
+            audio_lat = audio_sched.step(torch.ones_like(audio_lat), ta, audio_lat, return_dict=False)[0]
+        # Primary scheduler & transformer session completely unaffected by audio_sched!
+        assert len(lib.sessions) == sessions_before
+        assert lib.sessions[-1]["ended"] is False
+        assert pipe.scheduler.step_index == 1
+        assert xfm._staged_schedule.num_steps == 6
+
+        # Complete remaining primary steps 1..5 -> closes ONLY on step 5
+        for idx in range(1, 6):
+            ti = pipe.scheduler.timesteps[idx]
+            vel = xfm(lat, encoder_hidden_states=ctx, timestep=ti).sample
+            lat = pipe.scheduler.step(vel, ti, lat, return_dict=False)[0]
+            if idx < 5:
+                assert lib.sessions[-1]["ended"] is False
+            else:
+                assert lib.sessions[-1]["ended"] is True
+
+        assert [s["step_index"] for s in lib.steps] == [0, 1, 2, 3, 4, 5]
+    finally:
+        xfm.close()
+
+    # (2) set_timesteps reset, set_begin_index reset, and mid-run shape-change reset
+    s_reset = FlowMatchResMultistepScheduler()
+    s_reset.set_timesteps(4)
+    x_a = torch.randn(1, 4, 8, 8)
+    s_reset.step(torch.randn_like(x_a), s_reset.timesteps[0], x_a, return_dict=False)
+    assert s_reset._old_denoised is not None
+
+    # Shape change at step 1 resets history and cleanly runs Euler instead of raising broadcast error
+    x_b = torch.randn(1, 4, 12, 12)
+    v_b = torch.randn_like(x_b)
+    s1 = float(s_reset.sigmas[1].item())
+    s2 = float(s_reset.sigmas[2].item())
+    out_b = s_reset.step(v_b, s_reset.timesteps[1], x_b, return_dict=False)[0]
+    assert torch.allclose(out_b, x_b + (s2 - s1) * v_b, atol=1e-6)
+    assert s_reset._old_denoised is not None and s_reset._old_denoised.shape == x_b.shape
+
+    # set_begin_index resets history and step at begin_index runs Euler
+    s_reset.set_timesteps(4)
+    assert s_reset._old_denoised is None
+    s_reset.step(torch.randn_like(x_a), s_reset.timesteps[0], x_a, return_dict=False)
+    assert s_reset._old_denoised is not None
+    s_reset.set_begin_index(2)
+    assert s_reset._old_denoised is None and s_reset._prev_sigma is None
+    s_reset._step_index = None
+    v_bi = torch.randn_like(x_a)
+    out_bi = s_reset.step(v_bi, s_reset.timesteps[2], x_a, return_dict=False)[0]
+    assert torch.allclose(
+        out_bi,
+        x_a + (float(s_reset.sigmas[3].item()) - float(s_reset.sigmas[2].item())) * v_bi,
+        atol=1e-6,
+    )
+
+    # (3) Pure-PyTorch fallback when diffusers is completely absent (subprocess with sys.modules['diffusers']=None)
+    repo_root = Path(__file__).resolve().parent.parent
+    script = """
+import copy, math, sys
+sys.modules["diffusers"] = None
+import torch
+import quantfunc
+from quantfunc.sampling import FlowMatchResMultistepScheduler, use_res_multistep_scheduler
+from quantfunc.sampling.res_multistep import _HAS_DIFFUSERS, _PureTorchFlowMatchBase
+
+assert _HAS_DIFFUSERS is False
+assert issubclass(FlowMatchResMultistepScheduler, _PureTorchFlowMatchBase)
+assert quantfunc.FlowMatchResMultistepScheduler is FlowMatchResMultistepScheduler
+
+sched = FlowMatchResMultistepScheduler.from_config({"shift": 2.0, "num_train_timesteps": 1000})
+assert sched.shift == 2.0 and sched.config.shift == 2.0 and len(sched) == 1000
+sched.set_timesteps(sigmas=[1.0, 0.75, 0.5, 0.25])
+assert len(sched.timesteps) == 4 and len(sched.sigmas) == 5
+
+# scale_noise works cleanly
+x0 = torch.ones(1, 2, 4, 4)
+eps = torch.zeros(1, 2, 4, 4)
+noisy = sched.scale_noise(x0, sched.timesteps[1], eps)
+assert noisy.shape == x0.shape
+
+# Constant-x0 exact recovery over all 4 steps
+v = eps - x0
+s0 = float(sched.sigmas[0].item())
+x = (1.0 - s0) * x0 + s0 * eps
+for i, t in enumerate(sched.timesteps):
+    out = sched.step(v, t, x, return_dict=(i % 2 == 0))
+    x = out.prev_sample if i % 2 == 0 else out[0]
+    assert sched.step_index == i + 1
+assert (x - x0).abs().max().item() < 1e-6
+
+# Deepcopy isolates history
+sched.set_timesteps(4)
+sched.step(v, sched.timesteps[0], x0)
+assert sched._old_denoised is not None
+clone = copy.deepcopy(sched)
+assert clone._old_denoised is None and clone._prev_sigma is None
+
+# Pure-PyTorch fallback: sampler_mode="euler"
+sched_euler = FlowMatchResMultistepScheduler(sampler_mode="euler")
+sched_euler.set_timesteps(sigmas=[1.0, 0.75, 0.5, 0.25])
+xe = (1.0 - float(sched_euler.sigmas[0].item())) * x0 + float(sched_euler.sigmas[0].item()) * eps
+for i, t in enumerate(sched_euler.timesteps):
+    s_cur = float(sched_euler.sigmas[i].item())
+    s_nxt = float(sched_euler.sigmas[i + 1].item())
+    expected = xe + (s_nxt - s_cur) * v
+    xe = sched_euler.step(v, t, xe, return_dict=False)[0]
+    assert torch.allclose(xe, expected, atol=1e-6)
+    assert sched_euler._old_denoised is None and sched_euler.step_index == i + 1
+
+# Pure-PyTorch fallback: use_dynamic_shifting=True with mu (and missing mu fails closed)
+sched_dyn = FlowMatchResMultistepScheduler(use_dynamic_shifting=True, shift_terminal=0.05)
+try:
+    sched_dyn.set_timesteps(4)
+    raise SystemExit("Expected ValueError when mu is omitted for use_dynamic_shifting=True")
+except ValueError:
+    pass
+sched_dyn.set_timesteps(4, mu=0.8)
+assert len(sched_dyn.timesteps) == 4 and len(sched_dyn.sigmas) == 5
+assert abs(float(sched_dyn.sigmas[-2].item()) - 0.05) < 1e-5
+
+# Pure-PyTorch fallback: per_token_timesteps delegation
+sched_pt = FlowMatchResMultistepScheduler()
+sched_pt.set_timesteps(4)
+sample_pt = torch.randn(1, 6, 4, dtype=torch.float32)
+vel_pt = torch.randn_like(sample_pt)
+pt_ts = torch.full((1, 6), float(sched_pt.timesteps[0].item()), dtype=torch.float32)
+out_pt = sched_pt.step(vel_pt, sched_pt.timesteps[0], sample_pt, per_token_timesteps=pt_ts, return_dict=False)[0]
+assert out_pt.shape == sample_pt.shape and torch.isfinite(out_pt).all()
+assert sched_pt.step_index == 1 and sched_pt._old_denoised is None
+
+# Pure-PyTorch fallback: stochastic_sampling=True delegates cleanly & clears history
+sched_stoch = FlowMatchResMultistepScheduler(stochastic_sampling=True)
+sched_stoch.set_timesteps(4)
+sched_stoch._old_denoised = x0.clone()
+sched_stoch._prev_sigma = 1.0
+out_stoch = sched_stoch.step(v, sched_stoch.timesteps[0], x0, return_dict=True)
+assert hasattr(out_stoch, "prev_sample") and torch.isfinite(out_stoch.prev_sample).all()
+assert sched_stoch.step_index == 1 and sched_stoch._old_denoised is None and sched_stoch._prev_sigma is None
+
+# Pure-PyTorch fallback: integer timestep rejection (both subclass and _PureTorchFlowMatchBase.step)
+base_only = _PureTorchFlowMatchBase()
+base_only.set_timesteps(4)
+for bad_t in (0, torch.tensor(0, dtype=torch.long)):
+    for target_s in (sched, base_only):
+        try:
+            target_s.step(v, bad_t, x0)
+            raise SystemExit(f"Expected ValueError for integer timestep {bad_t!r} on {type(target_s).__name__}")
+        except ValueError:
+            pass
+
+assert sys.modules["diffusers"] is None
+"""
+    env = dict(os.environ)
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    env["PYTHONPATH"] = str(repo_root) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    proc = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+
+
+def test_use_res_multistep_scheduler_and_mutation_arms() -> None:
+    pytest.importorskip("diffusers")
+    from diffusers import DDIMScheduler, FlowMatchEulerDiscreteScheduler
+
+    # (1) Converts FlowMatchEulerDiscreteScheduler preserving config & runtime shift
+    euler = FlowMatchEulerDiscreteScheduler(shift=3.0, use_dynamic_shifting=True, shift_terminal=0.05)
+    euler.set_shift(4.0)
+    pipe = SimpleNamespace(transformer=_StubTransformer(), scheduler=euler)
+
+    active = use_res_multistep_scheduler(pipe)
+    assert isinstance(active, FlowMatchResMultistepScheduler)
+    assert pipe.scheduler is active
+    assert active.config.use_dynamic_shifting is True
+    assert active.config.shift_terminal == pytest.approx(0.05)
+    assert active.shift == pytest.approx(4.0)
+
+    # Idempotent no-op
+    assert use_res_multistep_scheduler(pipe) is active
+
+    # Preserves non-FlowMatch-Euler schedulers unless force=True
+    ddim = DDIMScheduler()
+    pipe_ddim = SimpleNamespace(transformer=_StubTransformer(), scheduler=ddim)
+    assert use_res_multistep_scheduler(pipe_ddim) is ddim
+    assert pipe_ddim.scheduler is ddim
+
+    dummy = _PostIncScheduler()
+    pipe_dummy = SimpleNamespace(transformer=_StubTransformer(), scheduler=dummy)
+    assert use_res_multistep_scheduler(pipe_dummy) is dummy
+    forced = use_res_multistep_scheduler(pipe_dummy, force=True)
+    assert isinstance(forced, FlowMatchResMultistepScheduler)
+    assert pipe_dummy.scheduler is forced
+
+    # Re-attaches hooks cleanly if called after attach_session_hooks
+    pipe_hooked = SimpleNamespace(
+        transformer=_StubTransformer(),
+        scheduler=FlowMatchEulerDiscreteScheduler(shift=2.0),
+    )
+    attach_session_hooks(pipe_hooked)
+    replaced = use_res_multistep_scheduler(pipe_hooked)
+    assert isinstance(replaced, FlowMatchResMultistepScheduler)
+    assert "set_timesteps" in replaced.__dict__
+    replaced.set_timesteps(2)
+    assert len(pipe_hooked.transformer.staged_schedules) == 1
+
+    # (2) Mutation arm M_res_1: forcing Euler mode MUST fail 2nd-order ComfyUI parity (< 1e-6)
+    sigmas = [1.0, 0.85, 0.65, 0.45, 0.25, 0.1]
+    x_init = torch.randn(1, 4, 6, 6, generator=torch.Generator().manual_seed(7))
+
+    def _vel(x: torch.Tensor, sigma: float) -> torch.Tensor:
+        return 0.6 * x - 0.4 * torch.cos(x) + 0.15 * sigma
+
+    ref_final, _ = _comfy_res_multistep_reference(x_init, torch.tensor([*sigmas, 0.0]), _vel)
+
+    def _run_mode(mode: str) -> torch.Tensor:
+        sc = FlowMatchResMultistepScheduler(sampler_mode=mode)  # type: ignore[arg-type]
+        sc.set_timesteps(sigmas=sigmas)
+        cur = x_init.clone()
+        for i, t in enumerate(sc.timesteps):
+            cur = sc.step(_vel(cur, float(sc.sigmas[i].item())), t, cur, return_dict=False)[0]
+        return cur
+
+    # Mutated (Euler) turns RED on parity assertion
+    with pytest.raises(AssertionError):
+        assert (_run_mode("euler") - ref_final).abs().max().item() < 1e-6
+    # Control (res_multistep) passes GREEN
+    assert (_run_mode("res_multistep") - ref_final).abs().max().item() < 1e-6
+
+    # (3) Mutation arm M_res_2: copying _old_denoised in __deepcopy__ breaks history isolation
+    sc_iso = FlowMatchResMultistepScheduler()
+    sc_iso.set_timesteps(4)
+    sc_iso.step(torch.ones(1, 4, 4, 4), sc_iso.timesteps[0], torch.ones(1, 4, 4, 4))
+    assert sc_iso._old_denoised is not None
+
+    leaky_clone = copy.copy(sc_iso)  # MUTATION: shallow copy retains _old_denoised!
+    with pytest.raises(AssertionError):
+        assert leaky_clone._old_denoised is None
+    # Control: real copy.deepcopy clears history
+    clean_clone = copy.deepcopy(sc_iso)
+    assert clean_clone._old_denoised is None and clean_clone._prev_sigma is None
+    assert math.isfinite(float(sc_iso._prev_sigma or 0.0))
+
 
 

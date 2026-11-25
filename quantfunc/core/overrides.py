@@ -44,6 +44,8 @@ class _UnsetType:
 
 UNSET: Final[_UnsetType] = _UnsetType()
 
+VALID_SAMPLERS: tuple[str, ...] = ("res_multistep", "euler")
+
 _CANONICAL_FIELDS: frozenset[str] = frozenset(
     {
         "quality_enhance",
@@ -53,6 +55,7 @@ _CANONICAL_FIELDS: frozenset[str] = frozenset(
         "attention_backend",
         "loras",
         "default_steps",
+        "sampler",
     }
 )
 _ALIAS_MAP: dict[str, str] = {
@@ -79,6 +82,7 @@ class RuntimeOverrides:
     attention_backend: str | _UnsetType = UNSET
     loras: tuple[LoRAEntry, ...] | _UnsetType = UNSET
     default_steps: int | _UnsetType = UNSET
+    sampler: str | _UnsetType = UNSET
 
     def __post_init__(self) -> None:
         if self.quality_enhance is not UNSET:
@@ -131,6 +135,12 @@ class RuntimeOverrides:
                     f"RuntimeOverrides.default_steps must be a positive integer, got {self.default_steps!r}"
                 )
             object.__setattr__(self, "default_steps", int(self.default_steps))
+
+        if self.sampler is not UNSET:
+            if not isinstance(self.sampler, str) or self.sampler not in VALID_SAMPLERS:
+                raise ValueError(
+                    f"RuntimeOverrides.sampler must be one of {VALID_SAMPLERS}, got {self.sampler!r}"
+                )
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> RuntimeOverrides:
@@ -195,6 +205,7 @@ class RuntimeOverrides:
             and self.attention_backend is UNSET
             and self.loras is UNSET
             and self.default_steps is UNSET
+            and self.sampler is UNSET
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -214,10 +225,13 @@ class RuntimeOverrides:
             out["loras"] = [{"path": entry.path, "scale": float(entry.scale)} for entry in self.loras]
         if self.default_steps is not UNSET:
             out["default_steps"] = int(self.default_steps)
+        if self.sampler is not UNSET:
+            out["sampler"] = str(self.sampler)
         return out
 
 
 __all__ = [
     "UNSET",
+    "VALID_SAMPLERS",
     "RuntimeOverrides",
 ]

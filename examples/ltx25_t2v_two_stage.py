@@ -1,8 +1,10 @@
 """LTX-2.5 audio-video two-stage generation with 2x neural latent upscaling.
 
-Demonstrates ``ensure_deterministic_scheduler``, block/step caching, Sol sparse
-attention, ``LTX2NeuralLatentUpscaler``, and Stage-2 latent-level frozen audio
-restoration executed before ``audio_vae.decode`` and ``vocoder``.
+Demonstrates ``ensure_deterministic_scheduler``, default ``res_multistep``
+scheduler alignment (with ``copy.deepcopy`` history isolation across dual
+video/audio schedulers), block/step caching, Sol sparse attention,
+``LTX2NeuralLatentUpscaler``, and Stage-2 latent-level frozen audio restoration
+executed before ``audio_vae.decode`` and ``vocoder``.
 """
 
 from __future__ import annotations

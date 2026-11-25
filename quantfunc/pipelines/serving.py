@@ -20,8 +20,11 @@ from quantfunc.accelerate.hooks import (
 )
 from quantfunc.accelerate.serving import (
     _acquire_lock,
+    _merge_sampler_override,
+    _resolve_active_scheduler,
     _validate_av_conditions,
     _validate_busy_timeout,
+    _validate_sampler,
     get_pipeline_lock,
     request_scope,
     snapshot_cache,
@@ -249,6 +252,7 @@ class ServingPipeline:
         prompt: Any = UNSET,
         *,
         overrides: RuntimeOverrides | Mapping[str, Any] | None = None,
+        sampler: str | None = None,
         stages: MultiStageRunner | Sequence[StageSpec] | None = None,
         return_all_stages: bool = False,
         ref_audio: Any = UNSET,
@@ -281,6 +285,8 @@ class ServingPipeline:
             )
 
         parsed_overrides = RuntimeOverrides.from_any(overrides)
+        eff_sampler = _validate_sampler(sampler)
+        parsed_overrides = _merge_sampler_override(parsed_overrides, eff_sampler)
         _validate_av_conditions(av_conditions)
 
         call_kwargs: dict[str, Any] = dict(pipe_kwargs)
@@ -342,6 +348,7 @@ class ServingPipeline:
         prompt: Any = UNSET,
         *,
         overrides: RuntimeOverrides | Mapping[str, Any] | None = None,
+        sampler: str | None = None,
         stages: MultiStageRunner | Sequence[StageSpec] | None = None,
         return_all_stages: bool = False,
         ref_audio: Any = UNSET,
@@ -356,6 +363,7 @@ class ServingPipeline:
             self.generate,
             prompt,
             overrides=overrides,
+            sampler=sampler,
             stages=stages,
             return_all_stages=return_all_stages,
             ref_audio=ref_audio,
@@ -408,6 +416,11 @@ class ServingPipeline:
                     }
                 )
 
+            sched = _resolve_active_scheduler(self._pipe)
+            sampler_mode = getattr(sched, "sampler_mode", None) if sched is not None else None
+            if not isinstance(sampler_mode, str):
+                sampler_mode = None
+
             return {
                 "ready": bool(not closed),
                 "closed": bool(closed),
@@ -417,6 +430,7 @@ class ServingPipeline:
                 "failed_requests": int(failed_requests),
                 "sticky_loras": bool(self._sticky_loras),
                 "busy_timeout": self._busy_timeout,
+                "sampler_mode": sampler_mode,
                 "lora_aliases": sorted(self._lora_registry.keys()) if self._lora_registry is not None else [],
                 "transformers": transformer_infos,
             }

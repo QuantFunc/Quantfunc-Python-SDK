@@ -94,6 +94,14 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "denoise_sigmas": ("quantfunc.sampling.sigmas", "denoise_sigmas"),
     "build_linear_sigmas": ("quantfunc.sampling.sigmas", "build_linear_sigmas"),
     "FlowMatchRenoise": ("quantfunc.sampling.renoise", "FlowMatchRenoise"),
+    "FlowMatchResMultistepScheduler": (
+        "quantfunc.sampling.res_multistep",
+        "FlowMatchResMultistepScheduler",
+    ),
+    "use_res_multistep_scheduler": (
+        "quantfunc.sampling.res_multistep",
+        "use_res_multistep_scheduler",
+    ),
     "LatentUpscaler": ("quantfunc.sampling.upscalers", "LatentUpscaler"),
     "InterpolateLatentUpscaler": ("quantfunc.sampling.upscalers", "InterpolateLatentUpscaler"),
     "video_only_upscaler": ("quantfunc.sampling.upscalers", "video_only_upscaler"),

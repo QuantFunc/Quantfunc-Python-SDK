@@ -1,4 +1,4 @@
-"""Qwen-Image-2.1 6-step T2I with Lightning LoRA hot-loading and pre-norm text encoding."""
+"""Qwen-Image-2.1 6-step T2I with default ``res_multistep`` alignment, Lightning LoRA hot-loading, and pre-norm text encoding."""
 
 from __future__ import annotations
 

@@ -7,6 +7,12 @@ from collections.abc import Sequence
 from typing import Any
 
 from quantfunc.accelerate.hooks import attach_session_hooks, enable_offload
+from quantfunc.sampling.res_multistep import (
+    FlowMatchResMultistepScheduler,
+    use_res_multistep_scheduler,
+)
+
+_VALID_PIPELINE_SCHEDULERS: tuple[str, ...] = ("res_multistep", "euler", "keep")
 
 
 def import_diffusers_class(
@@ -56,10 +62,27 @@ def finalize_pipeline_load(
     attach_hooks: bool = True,
     offload: str | None = None,
     primary_scheduler: Any | None = None,
+    scheduler: str | None = "res_multistep",
 ) -> Any:
-    """Attach Tier-1 session hooks and optional CPU offload to a loaded pipeline."""
+    """Configure default scheduler, attach Tier-1 session hooks, and optional CPU offload."""
+    eff_scheduler = "keep" if scheduler is None else scheduler
+    if not isinstance(eff_scheduler, str) or eff_scheduler not in _VALID_PIPELINE_SCHEDULERS:
+        raise ValueError(
+            f"Unsupported scheduler {scheduler!r}; expected one of {_VALID_PIPELINE_SCHEDULERS} or None."
+        )
+
+    eff_primary = primary_scheduler
+    if eff_scheduler == "res_multistep":
+        active = use_res_multistep_scheduler(pipe, primary_scheduler=primary_scheduler)
+        if primary_scheduler is not None:
+            eff_primary = active
+    elif eff_scheduler == "euler":
+        target = primary_scheduler if primary_scheduler is not None else getattr(pipe, "scheduler", None)
+        if isinstance(target, FlowMatchResMultistepScheduler):
+            target.sampler_mode = "euler"
+
     if attach_hooks:
-        attach_session_hooks(pipe, primary_scheduler=primary_scheduler)
+        attach_session_hooks(pipe, primary_scheduler=eff_primary)
     if offload is not None:
         enable_offload(pipe, mode=offload)
     return pipe

@@ -7,6 +7,7 @@ L3a utility shared by ``request_scope`` and ``MultiStageRunner``. Never imports
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import inspect
 import logging
 import math
@@ -18,11 +19,12 @@ from typing import Any
 
 from quantfunc.accelerate.hooks import (
     _close_all_sessions,
+    _get_hook_state,
     discover_transformers,
     pipe_session,
 )
 from quantfunc.core.lora import normalize_lora_entries
-from quantfunc.core.overrides import UNSET, RuntimeOverrides
+from quantfunc.core.overrides import UNSET, VALID_SAMPLERS, RuntimeOverrides
 from quantfunc.models.base import QuantFuncBaseTransformer
 from quantfunc.native.errors import EngineBusyError, UnsupportedError
 
@@ -45,6 +47,7 @@ _KNOWN_OVERRIDE_KEYS: frozenset[str] = frozenset(
         "attention_backend",
         "loras",
         "default_steps",
+        "sampler",
     }
 )
 _VALID_AV_CONDITION_KEYS: frozenset[str] = frozenset({"keyframes", "refs", "text_token_tags"})
@@ -104,6 +107,33 @@ def _validate_av_conditions(av_conditions: Any) -> dict[str, Any] | None:
             f"Unknown av_conditions key(s): {unknown}; expected subset of {sorted(_VALID_AV_CONDITION_KEYS)}"
         )
     return dict(av_conditions)
+
+
+def _validate_sampler(sampler: Any) -> str | None:
+    if sampler is UNSET or sampler is None:
+        return None
+    if not isinstance(sampler, str) or sampler not in VALID_SAMPLERS:
+        raise ValueError(f"sampler must be one of {VALID_SAMPLERS} or None, got {sampler!r}")
+    return sampler
+
+
+def _merge_sampler_override(parsed: RuntimeOverrides, sampler: str | None) -> RuntimeOverrides:
+    if sampler is None:
+        return parsed
+    if parsed.sampler is not UNSET and parsed.sampler != sampler:
+        raise ValueError(
+            f"Conflicting sampler values: sampler={sampler!r} vs overrides.sampler={parsed.sampler!r}"
+        )
+    if parsed.sampler is UNSET:
+        return dataclasses.replace(parsed, sampler=sampler)
+    return parsed
+
+
+def _resolve_active_scheduler(pipe: Any) -> Any | None:
+    hook_state = _get_hook_state(pipe)
+    if hook_state is not None and hook_state.primary_scheduler is not None:
+        return hook_state.primary_scheduler
+    return getattr(pipe, "scheduler", None)
 
 
 def snapshot_cache(transformer: Any) -> tuple[float | None, float | None]:
@@ -316,11 +346,9 @@ def apply_runtime_overrides(
         return []
 
     transformers = discover_transformers(pipe)
-    if not transformers:
-        return []
 
-    # Fail-closed check before mutating any transformer if explicit policy is unsupported.
-    if required_policy_keys:
+    # Fail-closed check before mutating any scheduler or transformer if explicit policy is unsupported.
+    if required_policy_keys and transformers:
         for transformer in transformers:
             _ensure_lora_policy_supported(transformer, required_policy_keys)
 
@@ -329,6 +357,18 @@ def apply_runtime_overrides(
 
     saved_records: list[tuple[Any, list[tuple[str, Any]]]] = []
     rollback_records: list[tuple[Any, list[tuple[str, Any]]]] = []
+
+    if parsed.sampler is not UNSET:
+        sched = _resolve_active_scheduler(pipe)
+        if sched is not None and hasattr(sched, "sampler_mode"):
+            prev_mode = sched.sampler_mode
+            sched.sampler_mode = parsed.sampler
+            sched_rec = (sched, [("__sampler_mode__", prev_mode)])
+            saved_records.append(sched_rec)
+            rollback_records.append(sched_rec)
+
+    if not transformers:
+        return saved_records
 
     for transformer in transformers:
         saved: list[tuple[str, Any]] = []
@@ -489,6 +529,8 @@ def restore_runtime_overrides(
                             set_fn(prev)
                         else:
                             transformer.loras = list(prev)
+                elif key == "__sampler_mode__":
+                    transformer.sampler_mode = prev
                 elif key == "default_steps":
                     if callable(getattr(transformer, "set_default_steps", None)) and prev is not None:
                         transformer.set_default_steps(prev)
@@ -564,6 +606,7 @@ def request_scope(
     lora_registry: Mapping[str, str | os.PathLike[str]] | None = None,
     allowed_lora_roots: Sequence[str | os.PathLike[str]] | None = None,
     strict_lora_registry: bool | None = None,
+    sampler: str | None = None,
     ref_audio: Any = UNSET,
     av_conditions: Mapping[str, Any] | None | Any = UNSET,
     clear_conditions_on_exit: bool = True,
@@ -581,6 +624,8 @@ def request_scope(
     if strict_lora_registry is not None and not isinstance(strict_lora_registry, bool):
         raise ValueError(f"strict_lora_registry must be bool or None, got {strict_lora_registry!r}")
     parsed_overrides = RuntimeOverrides.from_any(overrides)
+    eff_sampler = _validate_sampler(sampler)
+    parsed_overrides = _merge_sampler_override(parsed_overrides, eff_sampler)
 
     norm_default_loras: Any = UNSET
     if default_loras is not UNSET:
@@ -638,7 +683,7 @@ def request_scope(
                 elif cleanup_error is None:
                     cleanup_error = exc
 
-            # (ii) Clear per-request conditions & staged schedules
+            # (ii) Clear per-request conditions, staged schedules & multistep history
             if clear_conditions_on_exit:
                 for transformer in discover_transformers(pipe):
                     try:
@@ -647,6 +692,19 @@ def request_scope(
                         if body_exc is not None:
                             logger.warning(
                                 "Secondary error resetting transformer request state during exit: %s",
+                                exc,
+                            )
+                        elif cleanup_error is None:
+                            cleanup_error = exc
+                sched = _resolve_active_scheduler(pipe)
+                reset_sched = getattr(sched, "reset_history", None) if sched is not None else None
+                if callable(reset_sched):
+                    try:
+                        reset_sched()
+                    except BaseException as exc:
+                        if body_exc is not None:
+                            logger.warning(
+                                "Secondary error resetting scheduler history during exit: %s",
                                 exc,
                             )
                         elif cleanup_error is None:

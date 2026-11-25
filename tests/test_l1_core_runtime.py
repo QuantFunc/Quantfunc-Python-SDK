@@ -761,16 +761,20 @@ def test_runtime_overrides_aliases_unset_and_refusals() -> None:
 import sys
 for mod in ("diffusers", "transformers", "accelerate", "huggingface_hub", "modelscope", "fastapi", "uvicorn", "torch"):
     sys.modules[mod] = None
-from quantfunc.core.overrides import RuntimeOverrides, UNSET
+from quantfunc.core.overrides import RuntimeOverrides, UNSET, VALID_SAMPLERS
 from quantfunc.core.sol import SolConfig
+assert VALID_SAMPLERS == ("res_multistep", "euler")
 ov = RuntimeOverrides.from_dict({
     "fbcache": 0.05,
     "stepcache": 0.1,
     "sol": {"enabled": True, "min_tokens": 4096},
     "loras": [{"name": "style", "scale": 0.8}],
+    "sampler": "euler",
 })
 assert ov.block_cache == 0.05 and ov.step_cache == 0.1
 assert isinstance(ov.sol, SolConfig) and ov.sol.min_sequence_length == 4096
+assert ov.sampler == "euler"
+assert ov.to_dict()["sampler"] == "euler"
 assert ov.quality_enhance is UNSET
 """
     env = dict(os.environ)
@@ -793,6 +797,7 @@ assert ov.quality_enhance is UNSET
     assert empty.to_dict() == {}
     assert empty.sol is overrides.UNSET
     assert empty.loras is overrides.UNSET
+    assert empty.sampler is overrides.UNSET
     assert overrides.RuntimeOverrides.from_any(None) == empty
     assert overrides.RuntimeOverrides.from_any(overrides.UNSET) == empty  # type: ignore[arg-type]
     assert overrides.RuntimeOverrides.from_any(empty) is empty
@@ -827,6 +832,7 @@ assert ov.quality_enhance is UNSET
                 {"path": "same", "name": "same", "scale": 1.0},
             ],
             "default_steps": 24,
+            "sampler": "euler",
         }
     )
     assert full.quality_enhance is True
@@ -835,6 +841,7 @@ assert ov.quality_enhance is UNSET
     assert isinstance(full.sol, sol.SolConfig) and full.sol.min_sequence_length == 2048
     assert full.attention_backend == "i4xi8"
     assert full.default_steps == 24
+    assert full.sampler == "euler"
     assert full.loras == (
         lora.LoRAEntry("a.safetensors", 1.0),
         lora.LoRAEntry("b.safetensors", 0.75),
@@ -843,6 +850,11 @@ assert ov.quality_enhance is UNSET
         lora.LoRAEntry("same", 1.0),
     )
     assert overrides.RuntimeOverrides.from_dict(full.to_dict()) == full
+    for valid_sampler in ("euler", "res_multistep"):
+        s_ov = overrides.RuntimeOverrides.from_dict({"sampler": valid_sampler})
+        assert s_ov.is_empty() is False
+        assert s_ov.to_dict() == {"sampler": valid_sampler}
+        assert overrides.RuntimeOverrides.from_dict(s_ov.to_dict()) == s_ov
     assert overrides.RuntimeOverrides.from_dict({"attention_backend": "sage"}).attention_backend == "int8"
     assert overrides.RuntimeOverrides.from_dict({"attention_backend": "flash"}).attention_backend == "fp16"
 
@@ -902,6 +914,11 @@ assert ov.quality_enhance is UNSET
         {"loras": [{"path": "a", "extra": 1}]},
         {"loras": [{"name": "a\x00b"}]},
         {"loras": [{"path": "a", "scale": None}]},
+        {"sampler": None},
+        {"sampler": "bogus"},
+        {"sampler": ""},
+        {"sampler": True},
+        {"sampler": 123},
     ]
     for bad in bad_payloads:
         with pytest.raises(ValueError, match="."):

@@ -1,5 +1,8 @@
 """Krea-2 single-stage text-to-image generation with QuantFunc drop-in acceleration.
 
+Uses ``FlowMatchResMultistepScheduler`` (aligned with ComfyUI ``res_multistep``)
+by default via ``load_krea2_pipeline(..., scheduler="res_multistep")``; pass
+``scheduler="euler"`` or ``scheduler="keep"`` to opt out.
 Authentication is loaded from ``QUANTFUNC_API_KEY`` or ``~/.config/quantfunc/config.json``.
 """
 

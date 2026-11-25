@@ -6,8 +6,9 @@ Demonstrates how to keep a single warm pipeline resident in GPU memory via
 ``ref_audio``, ``av_conditions``, ``ref_latents``, ``image_slots``), engine
 runtime dials (``sol``, ``loras`` via logical registry aliases,
 ``quality_enhance``, ``fbcache``/``block_cache``, ``stepcache``/``step_cache``,
-``attention_backend``, ``default_steps``), and single-stage vs two-stage
-workflows without reloading base weights.
+``attention_backend``, ``default_steps``, ``sampler`` switching between default
+``res_multistep`` aligned with ComfyUI workflows and ``euler``), and
+single-stage vs two-stage workflows without reloading base weights.
 
 FastAPI and Uvicorn are strictly optional; when absent, the script falls back
 to a pure-stdlib ``ThreadingHTTPServer``.
@@ -40,8 +41,7 @@ import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if (_REPO_ROOT / "quantfunc").is_dir() and str(_REPO_ROOT) not in sys.path:
@@ -50,6 +50,7 @@ if (_REPO_ROOT / "quantfunc").is_dir() and str(_REPO_ROOT) not in sys.path:
 from quantfunc import (  # noqa: E402
     UNSET,
     EngineBusyError,
+    FlowMatchResMultistepScheduler,
     InvalidArgError,
     LoRAEntry,
     LoRAManager,
@@ -110,6 +111,7 @@ if HAS_FASTAPI and BaseModel is not None:
         attention_backend: Any = None
         loras: Any = None
         default_steps: Any = None
+        sampler: Literal["res_multistep", "euler"] | None = None
         mode: str | None = "single"
         stages: list[dict[str, Any]] | None = None
         return_all_stages: bool = False
@@ -166,6 +168,7 @@ _ALLOWED_GENERATE_KEYS: frozenset[str] = (
             "ref_latents",
             "image_slots",
             "overrides",
+            "sampler",
             "mode",
             "stages",
             "return_all_stages",
@@ -200,6 +203,7 @@ _FORBIDDEN_EXTRA_KWARGS: frozenset[str] = (
         {
             "clear_conditions_on_exit",
             "overrides",
+            "sampler",
             "stages",
             "return_all_stages",
             "ref_audio",
@@ -537,6 +541,15 @@ class ServingHTTPController:
             stages_arg = self.stage_builders[mode](payload)
 
         prompt_arg = payload["prompt"] if "prompt" in payload else UNSET
+        sampler_arg = payload.get("sampler")
+        if (
+            sampler_arg is not None
+            and "sampler" in merged_overrides
+            and merged_overrides["sampler"] != sampler_arg
+        ):
+            raise ValueError(
+                "Conflicting values for 'sampler' in top-level request and overrides."
+            )
         ref_audio_arg = payload["ref_audio"] if "ref_audio" in payload else UNSET
         av_cond_arg = payload["av_conditions"] if "av_conditions" in payload else UNSET
         busy_timeout_arg = payload["busy_timeout"] if "busy_timeout" in payload else UNSET
@@ -548,6 +561,7 @@ class ServingHTTPController:
         gen_kwargs: dict[str, Any] = {
             **pipe_kwargs,
             "overrides": parsed_overrides,
+            "sampler": sampler_arg,
             "stages": stages_arg,
             "return_all_stages": return_all_stages,
             "ref_audio": ref_audio_arg,
@@ -857,13 +871,8 @@ class _SelfTestPipe:
 
     def __init__(self, transformer: _SelfTestTransformer) -> None:
         self.transformer = transformer
-        self.scheduler = SimpleNamespace(
-            timesteps=[1000.0, 500.0],
-            sigmas=[1.0, 0.5, 0.0],
-            step_index=None,
-            set_timesteps=lambda n: None,
-            step=lambda *a, **kw: (None,),
-        )
+        self.scheduler = FlowMatchResMultistepScheduler()
+        self.scheduler.set_timesteps(2)
         self.calls: list[dict[str, Any]] = []
 
     def __call__(self, **kwargs: Any) -> dict[str, Any]:
@@ -883,6 +892,7 @@ class _SelfTestPipe:
             "step_cache": self.transformer.step_cache,
             "sol_enabled": bool(self.transformer.sol_config and self.transformer.sol_config.enabled),
             "attention_backend": self.transformer.attention_backend,
+            "sampler_mode": getattr(self.scheduler, "sampler_mode", None),
             "active_loras": [(e.path, e.scale) for e in self.transformer.active_loras],
             "lora_bind_count": len(self.transformer._handle.loras_history),
         }
@@ -967,9 +977,10 @@ def run_self_test() -> int:
             code, st = _http_json(base_url, "GET", "/v1/status")
             assert code == 200 and st["ready"] is True, f"status failed: {code} {st}"
             assert st["lora_aliases"] == ["style"]
+            assert st["sampler_mode"] == "res_multistep"
             assert str(root) not in json.dumps(st), "status leaked absolute host directory!"
 
-            # 2. Req 1: single-stage + style:0.8 + fbcache + sol + quality_enhance + int8 + safe media
+            # 2. Req 1: single-stage + default res_multistep + style:0.8 + fbcache + sol + quality_enhance + int8 + safe media
             code, r1 = _http_json(
                 base_url,
                 "POST",
@@ -992,10 +1003,11 @@ def run_self_test() -> int:
             assert abs(res1["block_cache"] - 0.05) < 1e-6
             assert res1["sol_enabled"] is True
             assert res1["attention_backend"] == "int8"
+            assert res1["sampler_mode"] == "res_multistep"
             assert res1["has_image"] is True and res1["has_mask"] is True
             assert res1["lora_bind_count"] == 1
 
-            # 3. Req 2: same LoRA (O(1) hit -> 0 extra binds!) + two-stage online switching
+            # 3. Req 2: same LoRA (O(1) hit -> 0 extra binds!) + online sampler="euler" + two-stage switching
             code, r2 = _http_json(
                 base_url,
                 "POST",
@@ -1003,6 +1015,7 @@ def run_self_test() -> int:
                 {
                     "prompt": "ocean sunset",
                     "loras": [{"name": "style", "scale": 0.8}],
+                    "sampler": "euler",
                     "mode": "two_stage",
                     "return_all_stages": True,
                 },
@@ -1011,10 +1024,12 @@ def run_self_test() -> int:
             stages_out = r2["result"]
             assert len(stages_out) == 2
             assert stages_out[0]["output"]["lora_bind_count"] == 1  # O(1) hit: 0 extra binds!
+            assert stages_out[0]["output"]["sampler_mode"] == "euler"
+            assert stages_out[1]["output"]["sampler_mode"] == "euler"
             assert stages_out[1]["output"]["quality_enhance"] is True
             assert stages_out[1]["output"]["width"] == 768
 
-            # 4. Req 3: omit loras -> resets to [] (zero cross-request leak) + single-stage
+            # 4. Req 3: omit loras & sampler -> resets to [] and restores default res_multistep + single-stage
             code, r3 = _http_json(
                 base_url,
                 "POST",
@@ -1025,8 +1040,16 @@ def run_self_test() -> int:
             assert r3["result"]["active_loras"] == []
             assert r3["result"]["quality_enhance"] is False
             assert r3["result"]["sol_enabled"] is False
+            assert r3["result"]["sampler_mode"] == "res_multistep"
 
-            # 5. Negative controls: 403 traversal, 400 unknown key, 400 alias conflict, 429 busy, 400 SSRF
+            # 5. Negative controls: 403 traversal, 400 unknown key, 400 invalid sampler, 400 alias conflict, 429 busy, 400 SSRF
+            code, _ = _http_json(
+                base_url,
+                "POST",
+                "/v1/generate",
+                {"prompt": "bad_sampler", "sampler": "invalid_sampler"},
+            )
+            assert code == 400, f"Expected 400 for invalid sampler, got {code}"
             code, _ = _http_json(
                 base_url,
                 "POST",
@@ -1102,8 +1125,14 @@ def run_self_test() -> int:
                     client = TestClient(app)
                     assert client.get("/health").status_code == 200
                     assert client.get("/v1/status").status_code == 200
-                    resp = client.post("/v1/generate", json={"prompt": "fastapi check", "sol": None})
+                    resp = client.post("/v1/generate", json={"prompt": "fastapi check", "sol": None, "sampler": "euler"})
                     assert resp.status_code == 200
+                    assert resp.json()["result"]["sampler_mode"] == "euler"
+                    resp_default = client.post("/v1/generate", json={"prompt": "fastapi default"})
+                    assert resp_default.status_code == 200
+                    assert resp_default.json()["result"]["sampler_mode"] == "res_multistep"
+                    bad_sampler_resp = client.post("/v1/generate", json={"prompt": "bad", "sampler": "unknown"})
+                    assert bad_sampler_resp.status_code in (400, 422)
                     bad_resp = client.post("/v1/generate", json={"prompt": "bad", "unknown_top_key": 1})
                     assert bad_resp.status_code in (400, 422)
                     fastapi_checked = True

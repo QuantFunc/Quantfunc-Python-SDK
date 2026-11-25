@@ -76,6 +76,7 @@ def load_qwenimage21_pipeline(
     offload_mode: str | None = None,
     attach_hooks: bool = True,
     variant: str = "t2i",
+    scheduler: str | None = "res_multistep",
     pipeline_cls: Any | None = None,
     **kwargs: Any,
 ) -> Any:
@@ -113,4 +114,9 @@ def load_qwenimage21_pipeline(
         pipe_kwargs["torch_dtype"] = torch_dtype
     pipe = cls.from_pretrained(model_id_or_path, transformer=transformer, **pipe_kwargs)
 
-    return finalize_pipeline_load(pipe, attach_hooks=attach_hooks, offload=offload_mode)
+    return finalize_pipeline_load(
+        pipe,
+        attach_hooks=attach_hooks,
+        offload=offload_mode,
+        scheduler=scheduler,
+    )
