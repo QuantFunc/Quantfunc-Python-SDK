@@ -52,6 +52,7 @@ all = [
     "transformers>=4.48.0",
     "huggingface_hub>=0.25.0",
     "modelscope>=1.20.0",
+    "pillow>=10.0.0",
 ]
 dev = [
     "pytest>=8.0",
@@ -59,9 +60,12 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://www.quantfunc.com"
+Homepage = "https://www.quantfunc.com/"
 Repository = "https://github.com/QuantFunc/Quantfunc-Python-SDK"
 Issues = "https://github.com/QuantFunc/Quantfunc-Python-SDK/issues"
+HuggingFace = "https://huggingface.co/QuantFunc"
+ModelScope = "https://www.modelscope.cn/profile/QuantFunc"
+Discord = "https://discord.gg/jCp9TpFWcn"
 
 [project.scripts]
 quantfunc = "quantfunc.cli:main"

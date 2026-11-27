@@ -1,13 +1,26 @@
+<div align="center" style="margin-top: 32px;">
+  <img src="https://raw.githubusercontent.com/QuantFunc/ComfyUI-QuantFunc/main/assets/logo.webp" width="300" alt="QuantFunc Logo">
+</div>
+
+<p align="center">
+  🌐 <a href="https://www.quantfunc.com/">Website</a> &nbsp;|&nbsp;
+  🤗 <a href="https://huggingface.co/QuantFunc">Hugging Face</a> &nbsp;|&nbsp;
+  🤖 <a href="https://www.modelscope.cn/profile/QuantFunc">ModelScope</a> &nbsp;|&nbsp;
+  💬 <a href="#wechat">WeChat (微信)</a> &nbsp;|&nbsp;
+  🎮 <a href="https://discord.gg/jCp9TpFWcn">Discord</a>
+</p>
+
 # QuantFunc Python SDK
 
-Drop-in, layered Python acceleration runtime for image, video, and audio-video diffusion pipelines built on `torch` and `diffusers`.
+Drop-in, layered Python acceleration runtime for image, video, and audio-video diffusion pipelines built on `torch` and `diffusers`, powered by **QuantFunc PC Engine `0.0.18`** (`4.0–5.5 MiB` native engine download on Linux; `14.0–17.6 MiB` on Windows for RTX 40/50 series and `21.8–28.3 MiB` for `sm75`/`sm86`).
 
-- **Pure-Python wheel (`py3-none-any`)**: only requires `torch>=2.4`; optional extras for `diffusers`, `transformers`, HuggingFace Hub, and ModelScope.
+- **Pure-Python wheel (`py3-none-any`)**: lightweight `torch>=2.4` core with [`requirements.txt`](requirements.txt) and optional extras for `diffusers`, `transformers`, HuggingFace Hub, and ModelScope.
 - **1–3 line drop-in**: replace a pipeline's `transformer` with a `QuantFunc*Transformer` and keep the rest of your `diffusers` workflow intact.
+- **Fast startup & native kernel speed**: `~0.19 s` cold init, `0.54–1.49 s` NVMe model loads (`1.8 ms` LoRA hot-swap), **1.15×–1.56×** median linear speedup over `ComfyUI-Kitchen` (`int8_convrot`), and **1.61×–5.31×** median attention speedup over PyTorch SDPA (`int8` cosine similarity `0.9989–0.9999`, 4K normal `0.9990–0.9999`).
 - **Zero-boilerplate session management**: automatic Tier-1 scheduler hooks (`attach_session_hooks`) and Tier-2 fallback tracking, without mutating `pipe.__class__`.
 - **ComfyUI-aligned `res_multistep` default**: drop-in `FlowMatchResMultistepScheduler` (2nd-order exponential multistep, `eta=0.0`) enabled automatically by all pipeline loaders (`scheduler="res_multistep"` by default, with `scheduler="euler"` / `"keep"` and zero-cost online per-request switching via `sampler="euler" | "res_multistep"`).
-- **Automatic native engine lifecycle**: zero-config install on first load, non-blocking background update checks with offline fallback, SHA-256 verification, and atomic rollback.
-- **Model-agnostic multi-stage sampling**: generic `MultiStageRunner` for 2-stage and N-stage workflows, plus thin presets for Krea-2, Qwen-Image-2.1, LTX-2.5 AV, and MiniMax-H3 AV.
+- **Automatic native engine lifecycle**: zero-config install on first load, non-blocking background update checks with offline fallback, SHA-256 verification, Windows locked-DLL rename-aside, and fail-closed rollback.
+- **Model-agnostic multi-stage sampling & LTX-2.5 AV conditioning**: generic `MultiStageRunner` for 2-stage and N-stage workflows, plus full LTX-2.5 `ref_audio` & per-frame video/audio mask support and thin presets for Krea-2, Qwen-Image-2.1, LTX-2.5 AV, and MiniMax-H3 AV.
 
 ---
 
@@ -78,13 +91,16 @@ transformer = AutoQuantFuncTransformer.from_pretrained("/path/to/checkpoint.safe
 ## Installation & Authentication
 
 ```bash
-# Core package + diffusers ecosystem
-pip install "quantfunc[diffusers]"
+# Option A: Clone and initialize the full bound dependency environment
+git clone https://github.com/QuantFunc/Quantfunc-Python-SDK.git
+cd Quantfunc-Python-SDK
+pip install -r requirements.txt
+pip install --no-deps -e .
 
-# Or install all optional integrations (diffusers, transformers, hf, modelscope)
-pip install "quantfunc[all]"
+# Option B: Direct install from GitHub (PEP 508 syntax, pip >= 25 compatible)
+pip install "quantfunc[all] @ git+https://github.com/QuantFunc/Quantfunc-Python-SDK.git@v0.1.0"
 
-# Optional: pre-download native engine binaries into ~/.cache/quantfunc/engine
+# Optional: pre-download native engine binaries (4–28 MiB per GPU) into ~/.cache/quantfunc/engine
 quantfunc install-engine
 
 # Store your QuantFunc API key safely (interactive prompt or --stdin; never passed in argv)
@@ -95,6 +111,8 @@ quantfunc auth set-key
 # Verify environment and configuration
 quantfunc doctor
 ```
+
+> **Note on PyTorch & CUDA:** Install a CUDA 12 or CUDA 13 build of `torch>=2.4` matching your NVIDIA driver before running `pip install -r requirements.txt` (or let your existing CUDA PyTorch environment satisfy `torch>=2.4`). For LTX-2.5 `diffusers` pipelines, `diffusers>=0.37` (or `diffusers@main`) is recommended; optional HTTP serving (`examples/12_http_fastapi_server.py`) uses `fastapi` and `uvicorn`.
 
 API keys are resolved in strict precedence order: explicit `api_key=` argument > `QUANTFUNC_API_KEY` environment variable > `~/.config/quantfunc/config.json` (written atomically with POSIX `0o600` permissions).
 
@@ -313,6 +331,16 @@ All 12 runnable example scripts live under [`examples/`](examples/) and read cre
 | [`examples/minimax_h3_ref2va_two_stage.py`](examples/minimax_h3_ref2va_two_stage.py) | MiniMax-H3 Ref2VA two-stage high-resolution refinement |
 | [`examples/custom_multi_stage.py`](examples/custom_multi_stage.py) | Custom 3-stage workflow (`draft -> mid -> high-res refine`) with a custom `LatentUpscaler` and per-stage overrides |
 | [`examples/12_http_fastapi_server.py`](examples/12_http_fastapi_server.py) | Online HTTP / FastAPI server (with stdlib fallback & pure-CPU `--self-test`) demonstrating per-request dial/LoRA/stage switching and LFI/SSRF protection |
+
+---
+
+## Community
+
+[Website](https://www.quantfunc.com/) · [Hugging Face](https://huggingface.co/QuantFunc) · [ModelScope](https://www.modelscope.cn/profile/QuantFunc) · [Discord](https://discord.gg/jCp9TpFWcn) · [ComfyUI Plugin](https://github.com/QuantFunc/ComfyUI-QuantFunc)
+
+<div align="center" id="wechat">
+  <img src="https://raw.githubusercontent.com/QuantFunc/ComfyUI-QuantFunc/main/assets/WeChat.jpg" width="220" alt="WeChat Group">
+</div>
 
 ---
 

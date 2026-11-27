@@ -1,0 +1,13 @@
+# Core & recommended runtime dependencies for QuantFunc Python SDK (v0.1.0)
+# Note: install a CUDA 12 or CUDA 13 build of PyTorch matching your NVIDIA driver first, e.g.:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+torch>=2.4
+
+# Diffusion & model pipeline dependencies (aligned with pyproject.toml [all])
+diffusers>=0.36.0
+accelerate>=1.12.0
+safetensors>=0.4.0
+transformers>=4.48.0
+huggingface_hub>=0.25.0
+modelscope>=1.20.0
+pillow>=10.0.0
