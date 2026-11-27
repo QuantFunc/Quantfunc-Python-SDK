@@ -984,6 +984,247 @@ def test_same_version_sha256_drift_redownload_and_atomic_rollback(
     assert (host_path.parent / "libquantfunc_kernels.so").read_bytes() == kern2
 
 
+def test_windows_locked_dll_same_version_update_renames_aside(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base_url = "https://releases.quantfunc.example/engine"
+    monkeypatch.setattr(installer, "_BIN_SUBDIR", "windows")
+    monkeypatch.setattr(installer, "_install_lock", lambda path: installer.contextlib.nullcontext())
+    monkeypatch.setattr(installer, "_torch_cuda_major", lambda: 13)
+    monkeypatch.setattr(installer, "_driver_cuda_major", lambda: 13)
+    monkeypatch.setattr(installer, "_gpu_sm", lambda idx=0: 120)
+    monkeypatch.setattr(installer.platform, "machine", lambda: "AMD64")
+    monkeypatch.setattr(installer, "_host_forbidden_cuda_pe", lambda path: [])
+    monkeypatch.delenv("QF_NATIVE_SO_PATH", raising=False)
+
+    def _win_routes(host_b: bytes, kern_b: bytes, addons: dict[str, bytes] | None = None) -> dict[str, bytes]:
+        sets_raw = json.dumps({"schema": 2, "sets": {"sm120a": [120]}}).encode("utf-8")
+        ver_entry: dict[str, Any] = {
+            "comfy": "0.0.08",
+            "sdk": "0.0.08",
+            "lib": "0.0.18",
+            "comfy-12": "0.0.08",
+            "sdk-12": "0.0.08",
+            "lib-12": "0.0.18",
+            "kernel_so": True,
+        }
+        if addons:
+            ver_entry["addons"] = list(addons.keys())
+        ver_raw = json.dumps({"win32": {"0.0.18": ver_entry}}).encode("utf-8")
+
+        def _s256(b: bytes) -> str:
+            return hashlib.sha256(b).hexdigest()
+
+        verify_win32 = {
+            "sets.json": _s256(sets_raw),
+            "quantfunc.dll": _s256(host_b),
+            "sm120a/libquantfunc_kernels.dll": _s256(kern_b),
+        }
+        routes = {
+            f"{base_url}/version.json": ver_raw,
+            f"{base_url}/0.0.18/windows/sets.json": sets_raw,
+            f"{base_url}/0.0.18/windows/quantfunc.dll": host_b,
+            f"{base_url}/0.0.18/windows/sm120a/libquantfunc_kernels.dll": kern_b,
+        }
+        if addons:
+            for aname, adata in addons.items():
+                verify_win32[f"sm120a/{aname}"] = _s256(adata)
+                routes[f"{base_url}/0.0.18/windows/sm120a/{aname}"] = adata
+        routes[f"{base_url}/0.0.18/verify.json"] = json.dumps({"schema": 1, "win32": verify_win32}).encode("utf-8")
+        return routes
+
+    real_replace = os.replace
+    real_remove = os.remove
+    real_rename = os.rename
+
+    # Guard 1: Windows fresh install (no existing dst) PermissionError propagates without rename-aside
+    fresh_dir = tmp_path / "win_fresh_perm"
+    r_fresh = _win_routes(b"MZ-FRESH-H", b"MZ-FRESH-K")
+    monkeypatch.setattr(installer, "_engine_http_open", lambda url: _FakeHttpResponse(url, r_fresh[url]))
+
+    def fresh_perm(src: Any, dst: Any) -> None:
+        if os.path.basename(str(dst)) == "libquantfunc_kernels.dll":
+            raise PermissionError(13, "WinError 5 fresh", str(dst))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", fresh_perm)
+    with pytest.raises(PermissionError):
+        installer.install_engine(engine_dir=fresh_dir, base_url=base_url)
+    monkeypatch.setattr(os, "replace", real_replace)
+
+    eng_dir = tmp_path / "win_eng"
+    addon_map = {"helper.stale-1.dll": b"ADDON-KEEP"}
+    h1, k1 = b"MZ-WIN-HOST-1", b"MZ-WIN-KERN-1"
+    r1 = _win_routes(h1, k1, addons=addon_map)
+    monkeypatch.setattr(installer, "_engine_http_open", lambda url: _FakeHttpResponse(url, r1[url]))
+    installer.install_engine(engine_dir=eng_dir, base_url=base_url)
+    host_path = Path(installer.resolve_so_path(engine_dir=eng_dir))
+    pair_dir = host_path.parent
+    marker_path = eng_dir / "windows" / ".engine-sm120a-cu13.json"
+    assert host_path.read_bytes() == h1
+    assert (pair_dir / "helper.stale-1.dll").read_bytes() == b"ADDON-KEEP"
+
+    # Simulate Windows loaded-DLL PermissionError on os.replace AND locked stale in finally
+    h2, k2 = b"MZ-WIN-HOST-2", b"MZ-WIN-KERN-2"
+    r2 = _win_routes(h2, k2, addons=addon_map)
+    monkeypatch.setattr(installer, "_engine_http_open", lambda url: _FakeHttpResponse(url, r2[url]))
+    perm_hits = {"n": 0}
+    locked_stales: set[str] = set()
+
+    def locked_replace(src: Any, dst: Any) -> None:
+        if os.path.exists(dst) and os.path.basename(str(dst)) in ("quantfunc.dll", "libquantfunc_kernels.dll"):
+            perm_hits["n"] += 1
+            raise PermissionError(13, "WinError 5 locked DLL", str(dst))
+        real_replace(src, dst)
+
+    def block_stale_remove(p: Any) -> None:
+        if ".stale-" in os.path.basename(str(p)):
+            locked_stales.add(os.path.basename(str(p)))
+            raise PermissionError(13, "WinError 5 locked stale", str(p))
+        real_remove(p)
+
+    monkeypatch.setattr(os, "replace", locked_replace)
+    monkeypatch.setattr(os, "remove", block_stale_remove)
+    installer.install_engine(engine_dir=eng_dir, base_url=base_url)
+    monkeypatch.setattr(os, "replace", real_replace)
+    assert perm_hits["n"] == 2
+    assert len(locked_stales) == 2
+    assert host_path.read_bytes() == h2
+    assert (pair_dir / "libquantfunc_kernels.dll").read_bytes() == k2
+    assert (pair_dir / "helper.stale-1.dll").read_bytes() == b"ADDON-KEEP"
+
+    # Skip branch tolerates locked stale OSError, then cleans unlocked stale while preserving add-on, symlink & dir
+    victim = tmp_path / "outside_victim.bin"
+    victim.write_bytes(b"SAFE")
+    stale_sym = pair_dir / ".quantfunc.dll.stale-999-abcdef01"
+    os.symlink(victim, stale_sym)
+    stale_sub = pair_dir / ".quantfunc.dll.stale-998-abcdef02"
+    stale_sub.mkdir()
+
+    installer.install_engine(engine_dir=eng_dir, base_url=base_url)
+    assert all((pair_dir / s).exists() for s in locked_stales)
+
+    monkeypatch.setattr(os, "remove", real_remove)
+    installer.install_engine(engine_dir=eng_dir, base_url=base_url)
+    assert not any((pair_dir / s).exists() for s in locked_stales)
+    assert (pair_dir / "helper.stale-1.dll").read_bytes() == b"ADDON-KEEP"
+    assert victim.exists() and stale_sym.is_symlink() and stale_sub.is_dir()
+    stale_sym.unlink()
+    stale_sub.rmdir()
+
+    # Update branch cleans pre-existing unlocked stale file
+    pre_stale = pair_dir / ".quantfunc.dll.stale-777-deadbeef"
+    pre_stale.write_bytes(b"OLD")
+    h2b, k2b = b"MZ-WIN-HOST-2B", b"MZ-WIN-KERN-2B"
+    r2b = _win_routes(h2b, k2b, addons=addon_map)
+    monkeypatch.setattr(installer, "_engine_http_open", lambda url: _FakeHttpResponse(url, r2b[url]))
+    installer.install_engine(engine_dir=eng_dir, base_url=base_url)
+    assert not pre_stale.exists()
+    assert host_path.read_bytes() == h2b
+    assert (pair_dir / "helper.stale-1.dll").read_bytes() == b"ADDON-KEEP"
+
+    # Negative 1: kernel renames aside, then host fails -> rollback restores h2b/k2b intact
+    h3, k3 = b"MZ-WIN-HOST-3", b"MZ-WIN-KERN-3"
+    r3 = _win_routes(h3, k3)
+    monkeypatch.setattr(installer, "_engine_http_open", lambda url: _FakeHttpResponse(url, r3[url]))
+
+    def fail_host_after_stale(src: Any, dst: Any) -> None:
+        if os.path.basename(str(dst)) == "libquantfunc_kernels.dll" and os.path.exists(dst):
+            raise PermissionError(13, "WinError 5 locked kernel", str(dst))
+        if os.path.basename(str(dst)) == "quantfunc.dll":
+            raise OSError("simulated disk full on host")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", fail_host_after_stale)
+    with pytest.raises(RuntimeError, match="existing installation preserved"):
+        installer.install_engine(engine_dir=eng_dir, base_url=base_url)
+    monkeypatch.setattr(os, "replace", real_replace)
+    assert host_path.read_bytes() == h2b
+    assert (pair_dir / "libquantfunc_kernels.dll").read_bytes() == k2b
+
+    # Negative 2: BOTH kernel & host rename aside + replace, then _claim fails -> rollback restores both
+    monkeypatch.setattr(os, "replace", locked_replace)
+    orig_claim = installer._claim
+    monkeypatch.setattr(installer, "_claim", lambda *a, **kw: (_ for _ in ()).throw(OSError("claim failed")))
+    with pytest.raises(RuntimeError, match="existing installation preserved"):
+        installer.install_engine(engine_dir=eng_dir, base_url=base_url)
+    monkeypatch.setattr(os, "replace", real_replace)
+    monkeypatch.setattr(installer, "_claim", orig_claim)
+    assert host_path.read_bytes() == h2b
+    assert (pair_dir / "libquantfunc_kernels.dll").read_bytes() == k2b
+
+    # Negative 3: rename dst->stale succeeds, retry replace fails -> outer rollback restores dst from stale
+    retry_hits = {"k": 0}
+
+    def fail_retry_replace(src: Any, dst: Any) -> None:
+        if os.path.basename(str(dst)) == "libquantfunc_kernels.dll":
+            retry_hits["k"] += 1
+            if retry_hits["k"] == 1:
+                raise PermissionError(13, "WinError 5 locked", str(dst))
+            raise OSError("AV locked .part on retry")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", fail_retry_replace)
+    with pytest.raises(RuntimeError, match="existing installation preserved"):
+        installer.install_engine(engine_dir=eng_dir, base_url=base_url)
+    monkeypatch.setattr(os, "replace", real_replace)
+    assert (pair_dir / "libquantfunc_kernels.dll").read_bytes() == k2b
+    assert marker_path.exists()
+
+    # Negative 4 (fail-closed): rename dst->stale succeeds, retry replace fails AND rename(stale,dst) fails
+    # MUST set rollback_failed=True, remove marker, and NEVER claim "existing installation preserved"
+    retry_hits["k"] = 0
+
+    def fail_restore_rename(src: Any, dst: Any) -> None:
+        if ".stale-" in os.path.basename(str(src)):
+            raise OSError("simulated restore rename failure")
+        real_rename(src, dst)
+
+    monkeypatch.setattr(os, "replace", fail_retry_replace)
+    monkeypatch.setattr(os, "rename", fail_restore_rename)
+    with pytest.raises(RuntimeError, match="rollback failed") as exc_info:
+        installer.install_engine(engine_dir=eng_dir, base_url=base_url)
+    assert "existing installation preserved" not in str(exc_info.value)
+    monkeypatch.setattr(os, "replace", real_replace)
+    monkeypatch.setattr(os, "rename", real_rename)
+    assert not marker_path.exists()
+
+
+def test_linux_permission_error_does_not_rename_aside(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base_url = "https://releases.quantfunc.example/engine"
+    monkeypatch.setattr(installer, "_BIN_SUBDIR", "linux")
+    monkeypatch.setattr(installer, "_torch_cuda_major", lambda: 13)
+    monkeypatch.setattr(installer, "_driver_cuda_major", lambda: 13)
+    monkeypatch.setattr(installer, "_gpu_sm", lambda idx=0: 89)
+    monkeypatch.setattr(installer.platform, "machine", lambda: "x86_64")
+    monkeypatch.delenv("QF_NATIVE_SO_PATH", raising=False)
+
+    routes1, _, _ = _make_mock_release(base_url=base_url)
+    monkeypatch.setattr(installer, "_engine_http_open", lambda url: _FakeHttpResponse(url, routes1[url]))
+    eng_dir = tmp_path / "lin_perm_eng"
+    installer.install_engine(engine_dir=eng_dir, base_url=base_url)
+    pair_dir = Path(installer.resolve_so_path(engine_dir=eng_dir)).parent
+
+    # Corrupt kernel so re-download runs, then inject PermissionError on replace
+    (pair_dir / "libquantfunc_kernels.so").write_bytes(b"corrupt")
+    real_replace = os.replace
+
+    def lin_perm(src: Any, dst: Any) -> None:
+        if os.path.basename(str(dst)) == "libquantfunc.so":
+            raise PermissionError(13, "POSIX EACCES", str(dst))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", lin_perm)
+    with pytest.raises(RuntimeError, match="PermissionError"):
+        installer.install_engine(engine_dir=eng_dir, base_url=base_url)
+    monkeypatch.setattr(os, "replace", real_replace)
+    assert not any(".stale-" in p.name for p in pair_dir.iterdir())
+
+
 def test_install_addons_and_reserved_name_rejection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

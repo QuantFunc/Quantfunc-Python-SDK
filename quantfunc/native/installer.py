@@ -73,6 +73,7 @@ _ENGINE_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _ENGINE_PAIR_ID_RE = re.compile(r"[0-9a-f]{32}")
 _ENGINE_MARKER_RE = re.compile(r"\.engine-([a-z][a-z0-9_]{0,31})-cu(\d+)\.json")
 _ENGINE_PAIR_RE = re.compile(r"(\d+\.\d+\.\d+)-([a-z][a-z0-9_]{0,31})-cu(\d+)")
+_ENGINE_STALE_RE = re.compile(r"\..+\.stale-\d+-[0-9a-f]+")
 _ENGINE_LOCAL_BUILD_LOCK = ".dev_lib_lock"
 _ENGINE_INSTALL_LOCKFILE = ".engine-install.lock"
 _ENGINE_REINSTALLED = ".reinstalled"
@@ -1130,6 +1131,7 @@ def _install_pair(
                 _harden_posix_mode(marker, 0o644)
                 _claim(bin_dir, marker, sets[gpu_set], engine_dir=engine_dir)
                 _install_addons(pair_have, version, versions[version], gpu_set, major, hashes, base_url)
+                _cleanup_stale(pair_have)
                 _engine_status("installed", f"engine {version} ({gpu_set}, CUDA {major})")
                 return have
         known_bad, have = version, None
@@ -1139,10 +1141,12 @@ def _install_pair(
     _refuse_symlink_dir(pair, "engine pair")
     os.makedirs(pair, exist_ok=True)
     _harden_posix_mode(pair, 0o755)
+    _cleanup_stale(pair)
     order = ([kernel] if kernel else []) + [host]
     got: dict[str, str] = {}
     part_by_name: dict[str, str] = {}
     backups: dict[str, str] = {}
+    stales: dict[str, str] = {}
     replaced: list[str] = []
     m = {
         "version": version,
@@ -1200,16 +1204,32 @@ def _install_pair(
                 backups[n] = bak
         for n in order:
             part_path = part_by_name[n]
-            os.replace(part_path, os.path.join(pair, n))
-            replaced.append(n)
+            dst = os.path.join(pair, n)
+            try:
+                os.replace(part_path, dst)
+                replaced.append(n)
+            except PermissionError:
+                if _BIN_SUBDIR != "windows" or not os.path.exists(dst):
+                    raise
+                stale = os.path.join(pair, f".{n}.stale-{os.getpid()}-{secrets.token_hex(4)}")
+                os.rename(dst, stale)
+                stales[n] = stale
+                replaced.append(n)
+                os.replace(part_path, dst)
         _install_addons(pair, version, versions[version], gpu_set, major, hashes, base_url)
         _claim(bin_dir, marker, sets[gpu_set], chosen=m, engine_dir=engine_dir)
     except Exception as exc:
         for n in reversed(replaced):
             dst = os.path.join(pair, n)
             bak = backups.get(n)
+            stale = stales.get(n)
             try:
-                if bak is not None and os.path.exists(bak):
+                if stale is not None and os.path.exists(stale):
+                    if os.path.exists(dst):
+                        os.remove(dst)
+                    os.rename(stale, dst)
+                    stales.pop(n, None)
+                elif bak is not None and os.path.exists(bak):
                     os.replace(bak, dst)
                     _harden_posix_mode(dst, 0o755)
                 elif os.path.exists(dst):
@@ -1236,7 +1256,7 @@ def _install_pair(
             ) from exc
         raise
     finally:
-        for p in list(part_by_name.values()) + list(backups.values()):
+        for p in list(part_by_name.values()) + list(backups.values()) + list(stales.values()):
             try:
                 os.remove(p)
             except OSError:
@@ -1249,6 +1269,18 @@ def _install_pair(
             shutil.rmtree(os.path.join(bin_dir, d), ignore_errors=True)
     _engine_status("installed", f"engine {version} ({gpu_set}, CUDA {major})")
     return m
+
+
+def _cleanup_stale(pair_dir: str) -> None:
+    for stale_fn in os.listdir(pair_dir):
+        if _ENGINE_STALE_RE.fullmatch(stale_fn):
+            stale_p = os.path.join(pair_dir, stale_fn)
+            if os.path.islink(stale_p) or not os.path.isfile(stale_p):
+                continue
+            try:
+                os.remove(stale_p)
+            except OSError:
+                pass
 
 
 # ── Self-healing on load failure & background daemon auto-updater ────────────
