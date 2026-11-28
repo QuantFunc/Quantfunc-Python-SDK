@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import atexit
 import ctypes
 import json
 import math
 import operator
 import os
 import sys
-from collections.abc import Mapping, Sequence
+import threading
+import weakref
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from .capi import (
@@ -145,7 +148,66 @@ SPARSE_SUBKEY_ALLOWLIST: frozenset[str] = frozenset(
 )
 
 # Pending reference-audio owners survive handle GC until explicit native cleanup completes.
+# Strict acyclic lock invariant: no path holding _destroy_lock ever acquires _LIVE_HANDLES_LOCK;
+# both are RLock, and registry discards while any _destroy_lock is held defer via _THREAD_DESTROY_STATE.
+_LIVE_HANDLES_LOCK = threading.RLock()
+_LIVE_HANDLES: weakref.WeakSet[QFEngineHandle] = weakref.WeakSet()
 _REFERENCE_AUDIO_PENDING_OWNERS: set[QFEngineHandle] = set()
+_REGISTRY_SNAPSHOT_DEPTH = 0
+_DEFERRED_REG_DISCARDS: list[tuple[QFEngineHandle, bool, bool]] = []
+_THREAD_DESTROY_STATE = threading.local()
+
+
+def _thread_destroy_depth() -> int:
+    return int(getattr(_THREAD_DESTROY_STATE, "depth", 0))
+
+
+def _enter_destroy_scope() -> None:
+    _THREAD_DESTROY_STATE.depth = _thread_destroy_depth() + 1
+
+
+def _exit_destroy_scope() -> list[tuple[QFEngineHandle, bool, bool]]:
+    cur = _thread_destroy_depth()
+    new_depth = cur - 1 if cur > 1 else 0
+    _THREAD_DESTROY_STATE.depth = new_depth
+    if new_depth > 0:
+        return []
+    pending: list[tuple[QFEngineHandle, bool, bool]] | None = getattr(
+        _THREAD_DESTROY_STATE, "pending_discards", None
+    )
+    if not pending:
+        return []
+    _THREAD_DESTROY_STATE.pending_discards = None
+    return pending
+
+
+def _apply_registry_discards_locked(items: Sequence[tuple[QFEngineHandle, bool, bool]]) -> None:
+    for item, discard_live, discard_pending in items:
+        if discard_live:
+            _LIVE_HANDLES.discard(item)
+        if discard_pending and not item.reference_audio_pending():
+            _REFERENCE_AUDIO_PENDING_OWNERS.discard(item)
+
+
+def _flush_registry_discards(items: Sequence[tuple[QFEngineHandle, bool, bool]]) -> None:
+    with _LIVE_HANDLES_LOCK:
+        if _REGISTRY_SNAPSHOT_DEPTH > 0:
+            _DEFERRED_REG_DISCARDS.extend(items)
+            return
+        _apply_registry_discards_locked(items)
+
+
+def _queue_or_flush_discards(items: Sequence[tuple[QFEngineHandle, bool, bool]]) -> None:
+    if _thread_destroy_depth() > 0:
+        pending: list[tuple[QFEngineHandle, bool, bool]] | None = getattr(
+            _THREAD_DESTROY_STATE, "pending_discards", None
+        )
+        if pending is None:
+            pending = []
+            _THREAD_DESTROY_STATE.pending_discards = pending
+        pending.extend(items)
+        return
+    _flush_registry_discards(items)
 
 
 def _enc(value: str | bytes | os.PathLike[str]) -> bytes:
@@ -458,6 +520,12 @@ class QFEngineHandle:
         self._begin_keep: QFSessionBeginParams | None = None
         self._reference_audio_owner: Any = None
         self._reference_audio_pending: bool = False
+        self._destroy_lock = threading.RLock()
+        self._destroying: bool = False
+        self._sys = sys
+        if self.xfm is not None:
+            with _LIVE_HANDLES_LOCK:
+                _LIVE_HANDLES.add(self)
 
     def __enter__(self) -> QFEngineHandle:
         return self
@@ -466,15 +534,24 @@ class QFEngineHandle:
         self.destroy()
 
     def __del__(self) -> None:
-        if sys.is_finalizing():
+        sys_mod = getattr(self, "_sys", None) or globals().get("sys")
+        if sys_mod is None or getattr(sys_mod, "is_finalizing", lambda: True)():
             return
-        if getattr(self, "_reference_audio_pending", False):
+        if (
+            getattr(self, "_destroying", False)
+            or getattr(self, "_reference_audio_pending", False)
+            or getattr(self, "xfm", None) is None
+        ):
             return
-        if getattr(self, "xfm", None) is not None:
-            try:
-                self.destroy()
-            except Exception:  # noqa: BLE001
-                pass
+        self._run_destroy_scope(
+            self._destroy_unlocked,
+            nonblocking=True,
+            suppress_errors=True,
+            guard=lambda: (
+                getattr(self, "xfm", None) is not None
+                and not getattr(self, "_reference_audio_pending", False)
+            ),
+        )
 
     def _require_live(self, op: str) -> None:
         if self.xfm is None:
@@ -624,13 +701,19 @@ class QFEngineHandle:
 
     def end_session_if_open(self) -> tuple[bool, bool]:
         """Close any open session cleanly; returns ``(was_open, succeeded)``."""
-        if self.current_session is None:
+        sess = getattr(self, "current_session", None)
+        if sess is None:
             return (False, True)
         ok = True
         try:
-            st = self.lib.qf_xfm_session_end(self.current_session)
-            if st != QF_OK:
+            lib = getattr(self, "lib", None)
+            end_fn = getattr(lib, "qf_xfm_session_end", None)
+            if not callable(end_fn):
                 ok = False
+            else:
+                st = end_fn(sess)
+                if st != QF_OK:
+                    ok = False
         except Exception:  # noqa: BLE001
             ok = False
         if ok:
@@ -641,32 +724,146 @@ class QFEngineHandle:
 
     def retain_reference_audio(self, owner: Any) -> None:
         """Pin a borrowed reference-audio owner until native async copy completion is proven."""
-        if self._reference_audio_pending:
+        if self.reference_audio_pending():
             raise RuntimeError("quantfunc: prior reference-audio begin has no proven copy completion")
         self._reference_audio_owner = owner
         self._reference_audio_pending = owner is not None
         if owner is not None:
-            _REFERENCE_AUDIO_PENDING_OWNERS.add(self)
+            with _LIVE_HANDLES_LOCK:
+                _REFERENCE_AUDIO_PENDING_OWNERS.add(self)
 
     def reference_audio_pending(self) -> bool:
-        return bool(self._reference_audio_pending)
+        return bool(getattr(self, "_reference_audio_pending", False))
 
     def reference_audio_copy_completed(self) -> None:
         self._reference_audio_pending = False
-        _REFERENCE_AUDIO_PENDING_OWNERS.discard(self)
+        if not getattr(self, "_destroying", False):
+            _queue_or_flush_discards(((self, False, True),))
 
-    def destroy(self) -> None:
-        """Close any active session and destroy the native ``qf_xfm_t`` handle."""
+    def _destroy_unlocked(self) -> None:
+        """Close any active session and destroy ``xfm``; caller must hold ``_destroy_lock`` if present."""
+        try:
+            self.end_session_if_open()
+        finally:
+            xfm = getattr(self, "xfm", None)
+            self.xfm = None
+            if xfm is not None:
+                destroy_fn = getattr(getattr(self, "lib", None), "qf_xfm_destroy", None)
+                if callable(destroy_fn):
+                    destroy_fn(xfm)
+
+    def _run_destroy_scope(
+        self,
+        body: Callable[[], None],
+        *,
+        nonblocking: bool = False,
+        suppress_errors: bool = False,
+        guard: Callable[[], bool] | None = None,
+    ) -> None:
+        destroyed = False
+        _enter_destroy_scope()
+        try:
+            lock = getattr(self, "_destroy_lock", None)
+            acquired = False
+            if lock is not None:
+                acquired = lock.acquire(blocking=False) if nonblocking else lock.acquire()
+                if not acquired:
+                    return
+            try:
+                if getattr(self, "_destroying", False):
+                    return
+                if guard is not None and not guard():
+                    return
+                self._destroying = True
+                destroyed = True
+                try:
+                    body()
+                except Exception:  # noqa: BLE001
+                    if not suppress_errors:
+                        raise
+                finally:
+                    self._destroying = False
+            finally:
+                if acquired and lock is not None:
+                    lock.release()
+        finally:
+            pending_flush = _exit_destroy_scope()
+            if destroyed:
+                pending_flush.append((self, True, not self.reference_audio_pending()))
+            if pending_flush:
+                _queue_or_flush_discards(pending_flush)
+
+    def _require_no_pending_audio(self) -> bool:
         if self.reference_audio_pending():
             raise RuntimeError(
                 "quantfunc: reference-audio copy is still pending; call unload_sync() or complete session close first"
             )
-        self.end_session_if_open()
-        if self.xfm is not None:
+        return True
+
+    def destroy(self) -> None:
+        """Close any active session and destroy the native ``qf_xfm_t`` handle."""
+        self._run_destroy_scope(self._destroy_unlocked, guard=self._require_no_pending_audio)
+
+    def _release_pending_for_shutdown(self) -> Any:
+        if not self.reference_audio_pending():
+            return None
+        for step in (self.unload_sync, self.end_session_if_open):
             try:
-                self.lib.qf_xfm_destroy(self.xfm)
+                step()
+            except Exception:  # noqa: BLE001
+                pass
+            if not self.reference_audio_pending():
+                return None
+        owner_keep = getattr(self, "_reference_audio_owner", None)
+        self.reference_audio_copy_completed()
+        self._reference_audio_owner = None
+        return owner_keep
+
+    def _destroy_for_shutdown(self) -> None:
+        """Force-retire the handle during interpreter exit while CUDA and Python are healthy."""
+
+        def _body() -> None:
+            owner_keep = self._release_pending_for_shutdown()
+            try:
+                self._destroy_unlocked()
             finally:
-                self.xfm = None
+                if owner_keep is not None:
+                    owner_keep = None
+
+        self._run_destroy_scope(_body)
+
+
+def _shutdown_all_handles() -> None:
+    """Destroy all live native handles before CPython finalizes and CUDA tears down."""
+    global _REGISTRY_SNAPSHOT_DEPTH
+    with _LIVE_HANDLES_LOCK:
+        _REGISTRY_SNAPSHOT_DEPTH += 1
+        try:
+            seen: set[int] = set()
+            handles: list[QFEngineHandle] = []
+            for h in _LIVE_HANDLES:
+                hid = id(h)
+                if hid not in seen:
+                    seen.add(hid)
+                    handles.append(h)
+            for h in _REFERENCE_AUDIO_PENDING_OWNERS:
+                hid = id(h)
+                if hid not in seen:
+                    seen.add(hid)
+                    handles.append(h)
+        finally:
+            _REGISTRY_SNAPSHOT_DEPTH -= 1
+            if _REGISTRY_SNAPSHOT_DEPTH == 0 and _DEFERRED_REG_DISCARDS:
+                _apply_registry_discards_locked(_DEFERRED_REG_DISCARDS)
+                _DEFERRED_REG_DISCARDS.clear()
+    for h in handles:
+        try:
+            h._destroy_for_shutdown()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+atexit.register(_shutdown_all_handles)
 
 
 __all__ = [

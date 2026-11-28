@@ -344,7 +344,7 @@ for mod in BLOCKED:
 
 import quantfunc
 
-assert quantfunc.__version__ == "0.1.0"
+assert quantfunc.__version__ == "0.1.1"
 for mod in BLOCKED:
     assert sys.modules.get(mod) is None, f"Optional dependency eagerly imported: {mod}"
 

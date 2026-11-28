@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import ctypes
+import gc
 import hashlib
 import io
 import json
 import os
 import stat
 import struct
+import subprocess
 import sys
+import threading
+import time
 import types
+import weakref
 from pathlib import Path
 from typing import Any
 
@@ -1420,3 +1425,1083 @@ def test_load_lib_auto_update_background_and_opt_out(
     loaded2 = loader.load_lib(device_id=0)
     assert loaded2 is fake_qf_lib
     assert len(bg_calls) == 1
+
+
+# ── Track 3 (SDK 0.1.1): Handle WeakSet, atexit Drain & 0.0.19 Matrix (S01-S08, S-M1-S-M3) ──
+
+
+class _TrackableOwner:
+    """Minimal weakref-capable owner simulating a borrowed host reference-audio buffer."""
+
+
+def _drain_live_handles_for_test() -> None:
+    gc.collect()
+    handle._shutdown_all_handles()
+    with handle._LIVE_HANDLES_LOCK:
+        handle._LIVE_HANDLES.clear()
+        handle._REFERENCE_AUDIO_PENDING_OWNERS.clear()
+
+
+def test_s01_weakset_gc_and_null_xfm_exclusion(fake_qf_lib: FakeQFLib) -> None:
+    _drain_live_handles_for_test()
+    try:
+        eng_null = handle.QFEngineHandle(fake_qf_lib, None)
+        with handle._LIVE_HANDLES_LOCK:
+            assert eng_null not in handle._LIVE_HANDLES
+
+        eng = handle.QFEngineHandle.create(fake_qf_lib, "/fake/s01.safetensors", {"model_arch": "krea2"})
+        hid = fake_qf_lib.created_configs[-1]["handle_id"]
+        with handle._LIVE_HANDLES_LOCK:
+            assert eng in handle._LIVE_HANDLES
+
+        ref = weakref.ref(eng)
+        del eng
+        gc.collect()
+
+        assert ref() is None
+        assert fake_qf_lib.destroyed == [hid]
+        with handle._LIVE_HANDLES_LOCK:
+            assert len(handle._LIVE_HANDLES) == 0
+    finally:
+        _drain_live_handles_for_test()
+
+
+def test_s02_destroy_thread_safe_idempotent_and_raising(fake_qf_lib: FakeQFLib) -> None:
+    _drain_live_handles_for_test()
+    try:
+        eng = handle.QFEngineHandle.create(fake_qf_lib, "/fake/s02.safetensors", {"model_arch": "krea2"})
+        orig_destroy = fake_qf_lib.qf_xfm_destroy
+        destroy_calls = 0
+
+        def _slow_destroy(xfm: Any) -> None:
+            nonlocal destroy_calls
+            destroy_calls += 1
+            time.sleep(0.01)
+            orig_destroy(xfm)
+
+        fake_qf_lib.qf_xfm_destroy = _slow_destroy
+
+        barrier = threading.Barrier(8)
+        thread_errors: list[BaseException] = []
+
+        def _worker() -> None:
+            try:
+                barrier.wait(timeout=5.0)
+                eng.destroy()
+            except BaseException as exc:  # noqa: BLE001
+                thread_errors.append(exc)
+
+        threads = [threading.Thread(target=_worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5.0)
+
+        assert thread_errors == []
+        assert destroy_calls == 1
+        assert eng.xfm is None
+        with handle._LIVE_HANDLES_LOCK:
+            assert eng not in handle._LIVE_HANDLES
+
+        # Idempotent 2nd call + context manager __enter__/__exit__
+        eng.destroy()
+        assert destroy_calls == 1
+        with handle.QFEngineHandle.create(fake_qf_lib, "/fake/s02ctx.safetensors", {"model_arch": "krea2"}) as ctx_eng:
+            assert ctx_eng.xfm is not None
+        assert ctx_eng.xfm is None
+        assert destroy_calls == 2
+
+        # Raising qf_xfm_destroy MUST still clear xfm=None and discard from _LIVE_HANDLES
+        err_lib = FakeQFLib()
+        err_calls = 0
+
+        def _boom_destroy(xfm: Any) -> None:
+            nonlocal err_calls
+            err_calls += 1
+            raise RuntimeError("boom-destroy")
+
+        err_lib.qf_xfm_destroy = _boom_destroy
+        eng2 = handle.QFEngineHandle.create(err_lib, "/fake/s02b.safetensors", {"model_arch": "krea2"})
+        with handle._LIVE_HANDLES_LOCK:
+            assert eng2 in handle._LIVE_HANDLES
+
+        with pytest.raises(RuntimeError, match="boom-destroy"):
+            eng2.destroy()
+        assert err_calls == 1
+        assert eng2.xfm is None
+        with handle._LIVE_HANDLES_LOCK:
+            assert eng2 not in handle._LIVE_HANDLES
+
+        eng2.destroy()
+        assert err_calls == 1
+    finally:
+        _drain_live_handles_for_test()
+
+
+def test_s03_shutdown_all_handles_drains_isolates_and_is_idempotent(fake_qf_lib: FakeQFLib) -> None:
+    _drain_live_handles_for_test()
+    try:
+        bad_lib = FakeQFLib()
+        bad_calls = 0
+
+        def _bad_destroy(xfm: Any) -> None:
+            nonlocal bad_calls
+            bad_calls += 1
+            raise RuntimeError("bad-handle-1")
+
+        bad_lib.qf_xfm_destroy = _bad_destroy
+
+        h1 = handle.QFEngineHandle.create(bad_lib, "/fake/m1.safetensors", {"model_arch": "krea2"})
+        h2 = handle.QFEngineHandle.create(fake_qf_lib, "/fake/m2.safetensors", {"model_arch": "krea2"})
+        h2.session_begin(512, 512, 4, (1, 16, 64), capi.QF_DTYPE_BF16)
+        h3 = handle.QFEngineHandle.create(fake_qf_lib, "/fake/m3.safetensors", {"model_arch": "krea2"})
+
+        with handle._LIVE_HANDLES_LOCK:
+            assert {h1, h2, h3}.issubset(set(handle._LIVE_HANDLES))
+
+        # Must isolate h1's error and cleanly destroy h2 (with active session) and h3
+        handle._shutdown_all_handles()
+
+        assert bad_calls == 1
+        assert h1.xfm is None
+        assert h2.xfm is None
+        assert h3.xfm is None
+        assert len(fake_qf_lib.destroyed) == 2
+        assert fake_qf_lib.sessions[-1]["ended"] is True
+        with handle._LIVE_HANDLES_LOCK:
+            assert len(handle._LIVE_HANDLES) == 0
+
+        # Idempotent 2nd call performs 0 additional destroys
+        handle._shutdown_all_handles()
+        assert bad_calls == 1
+        assert len(fake_qf_lib.destroyed) == 2
+    finally:
+        _drain_live_handles_for_test()
+
+
+def test_s04_shutdown_pending_reference_audio_and_concurrency() -> None:
+    _drain_live_handles_for_test()
+    try:
+        # (a) unload_sync() succeeds
+        lib_a = FakeQFLib()
+        h_a = handle.QFEngineHandle.create(lib_a, "/fake/a.safetensors", {"model_arch": "ltx25"})
+        owner_a = _TrackableOwner()
+        ref_a = weakref.ref(owner_a)
+        h_a.retain_reference_audio(owner_a)
+        del owner_a
+
+        # Runtime destroy() MUST still refuse while pending
+        with pytest.raises(RuntimeError, match="pending"):
+            h_a.destroy()
+        assert h_a.xfm is not None
+
+        handle._shutdown_all_handles()
+        gc.collect()
+        assert h_a.xfm is None
+        assert h_a.reference_audio_pending() is False
+        assert len(lib_a.unloads) == 1
+        assert len(lib_a.destroyed) == 1
+        assert ref_a() is None
+        with handle._LIVE_HANDLES_LOCK:
+            assert len(handle._REFERENCE_AUDIO_PENDING_OWNERS) == 0
+
+        # (b) unload_sync() fails, end_session_if_open() succeeds
+        lib_b = FakeQFLib()
+        lib_b.qf_xfm_unload_vram = lambda *a: (_ for _ in ()).throw(RuntimeError("unload failed"))
+        h_b = handle.QFEngineHandle.create(lib_b, "/fake/b.safetensors", {"model_arch": "ltx25"})
+        h_b.session_begin(512, 512, 4, (1, 16, 64), capi.QF_DTYPE_BF16)
+        owner_b = _TrackableOwner()
+        ref_b = weakref.ref(owner_b)
+        h_b.retain_reference_audio(owner_b)
+        del owner_b
+
+        handle._shutdown_all_handles()
+        gc.collect()
+        assert lib_b.sessions[-1]["ended"] is True
+        assert h_b.xfm is None
+        assert h_b.reference_audio_pending() is False
+        assert len(lib_b.destroyed) == 1
+        assert ref_b() is None
+        with handle._LIVE_HANDLES_LOCK:
+            assert len(handle._REFERENCE_AUDIO_PENDING_OWNERS) == 0
+
+        # (c) Both unload_sync() and end_session_if_open() fail -> owner_keep stays alive inside _destroy_lock across qf_xfm_destroy
+        lib_c = FakeQFLib(fail_session_end_status=capi.QF_ERR_INTERNAL)
+        lib_c.qf_xfm_unload_vram = lambda *a: (_ for _ in ()).throw(RuntimeError("unload failed"))
+        h_c = handle.QFEngineHandle.create(lib_c, "/fake/c.safetensors", {"model_arch": "ltx25"})
+        h_c.session_begin(512, 512, 4, (1, 16, 64), capi.QF_DTYPE_BF16)
+        owner_c = _TrackableOwner()
+        ref_c = weakref.ref(owner_c)
+        h_c.retain_reference_audio(owner_c)
+        del owner_c
+
+        observed_c: dict[str, bool] = {}
+        orig_c_destroy = lib_c.qf_xfm_destroy
+
+        def _spy_c_destroy(xfm: Any) -> None:
+            observed_c["owner_alive"] = ref_c() is not None
+            observed_c["lock_held"] = h_c._destroy_lock._is_owned()
+            orig_c_destroy(xfm)
+
+        lib_c.qf_xfm_destroy = _spy_c_destroy
+        handle._shutdown_all_handles()
+        gc.collect()
+
+        assert observed_c == {"owner_alive": True, "lock_held": True}
+        assert ref_c() is None
+        assert h_c.xfm is None
+        assert h_c.reference_audio_pending() is False
+        assert len(lib_c.destroyed) == 1
+        with handle._LIVE_HANDLES_LOCK:
+            assert len(handle._REFERENCE_AUDIO_PENDING_OWNERS) == 0
+
+        # (d.1) Multi-orphan _REFERENCE_AUDIO_PENDING_OWNERS exception isolation
+        lib_o1 = FakeQFLib()
+        lib_o1.qf_xfm_unload_vram = lambda *a: (_ for _ in ()).throw(RuntimeError("u1"))
+        orig_o1_destroy = lib_o1.qf_xfm_destroy
+
+        def _o1_destroy(xfm: Any) -> None:
+            orig_o1_destroy(xfm)
+            raise RuntimeError("orphan1 boom")
+
+        lib_o1.qf_xfm_destroy = _o1_destroy
+        lib_o2 = FakeQFLib()
+
+        o1 = handle.QFEngineHandle.create(lib_o1, "/fake/o1.safetensors", {"model_arch": "ltx25"})
+        o2 = handle.QFEngineHandle.create(lib_o2, "/fake/o2.safetensors", {"model_arch": "ltx25"})
+        with handle._LIVE_HANDLES_LOCK:
+            handle._LIVE_HANDLES.discard(o1)
+            handle._LIVE_HANDLES.discard(o2)
+        o1.retain_reference_audio(_TrackableOwner())
+        o2.retain_reference_audio(_TrackableOwner())
+
+        handle._shutdown_all_handles()
+        assert o1.xfm is None
+        assert o2.xfm is None
+        assert len(lib_o2.destroyed) == 1
+        with handle._LIVE_HANDLES_LOCK:
+            assert len(handle._REFERENCE_AUDIO_PENDING_OWNERS) == 0
+            assert len(handle._LIVE_HANDLES) == 0
+
+        # (d.2) Concurrent mutation safety under _LIVE_HANDLES_LOCK
+        conc_lib = FakeQFLib()
+        barrier = threading.Barrier(5)
+        conc_errors: list[BaseException] = []
+
+        def _mutator() -> None:
+            try:
+                barrier.wait(timeout=5.0)
+                for i in range(40):
+                    h = handle.QFEngineHandle.create(conc_lib, f"/fake/c_{i}.safetensors", {"model_arch": "ltx25"})
+                    h.retain_reference_audio(_TrackableOwner())
+                    if i % 2 == 0:
+                        h.reference_audio_copy_completed()
+                        h._reference_audio_owner = None
+                        h.destroy()
+            except BaseException as exc:  # noqa: BLE001
+                conc_errors.append(exc)
+
+        def _shutter() -> None:
+            try:
+                barrier.wait(timeout=5.0)
+                for _ in range(40):
+                    handle._shutdown_all_handles()
+            except BaseException as exc:  # noqa: BLE001
+                conc_errors.append(exc)
+
+        workers = [threading.Thread(target=_mutator) for _ in range(4)] + [threading.Thread(target=_shutter)]
+        for w in workers:
+            w.start()
+        for w in workers:
+            w.join(timeout=10.0)
+
+        assert conc_errors == []
+        handle._shutdown_all_handles()
+        with handle._LIVE_HANDLES_LOCK:
+            assert len(handle._LIVE_HANDLES) == 0
+            assert len(handle._REFERENCE_AUDIO_PENDING_OWNERS) == 0
+    finally:
+        _drain_live_handles_for_test()
+
+
+def test_s05_base_transformer_close_and_del_after_shutdown_all_handles(fake_qf_lib: FakeQFLib) -> None:
+    import torch
+
+    from quantfunc.models.base import QuantFuncBaseTransformer
+
+    _drain_live_handles_for_test()
+    try:
+        eng1 = handle.QFEngineHandle.create(fake_qf_lib, "/fake/m1.safetensors", {"model_arch": "krea2"})
+        model1 = QuantFuncBaseTransformer(handle=eng1, config={"model_arch": "krea2"}, torch_dtype=torch.float32)
+        eng1.session_begin(512, 512, 4, (1, 16, 64), capi.QF_DTYPE_BF16)
+
+        handle._shutdown_all_handles()
+        assert len(fake_qf_lib.destroyed) == 1
+        assert eng1.xfm is None
+        assert fake_qf_lib.sessions[-1]["ended"] is True
+
+        # Subsequent explicit close() MUST be a safe 0-call no-op
+        model1.close()
+        assert len(fake_qf_lib.destroyed) == 1
+        assert model1._closed is True
+
+        # Subsequent __del__() on a second model MUST also be a safe 0-call no-op
+        eng2 = handle.QFEngineHandle.create(fake_qf_lib, "/fake/m2.safetensors", {"model_arch": "krea2"})
+        model2 = QuantFuncBaseTransformer(handle=eng2, config={"model_arch": "krea2"}, torch_dtype=torch.float32)
+        handle._shutdown_all_handles()
+        assert len(fake_qf_lib.destroyed) == 2
+        del model2
+        gc.collect()
+        assert len(fake_qf_lib.destroyed) == 2
+    finally:
+        _drain_live_handles_for_test()
+
+
+def test_s06_subprocess_atexit_destroys_surviving_handles_before_finalizing() -> None:
+    repo_root = Path(__file__).resolve().parent.parent
+    script = """
+import atexit
+import sys
+
+events = []
+
+def _report():
+    before_fin = bool(events) and all(not fin for _, fin in events)
+    print(f"destroyed_before_finalizing={before_fin}, count={len(events)}")
+
+# Register reporter BEFORE importing quantfunc.native.handle so LIFO runs _shutdown_all_handles first.
+atexit.register(_report)
+
+from quantfunc.native.handle import QFEngineHandle
+
+class _StubLib:
+    def qf_xfm_destroy(self, xfm):
+        events.append((xfm, sys.is_finalizing()))
+
+lib = _StubLib()
+_KEEP = [QFEngineHandle(lib, 101), QFEngineHandle(lib, 102)]
+"""
+    env = dict(os.environ)
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    env["PYTHONPATH"] = str(repo_root) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+    assert proc.stderr == ""
+    assert "destroyed_before_finalizing=True, count=2" in proc.stdout
+
+
+def test_s07_handle_del_and_object_new_boundary_guards(
+    fake_qf_lib: FakeQFLib,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _drain_live_handles_for_test()
+    try:
+        # (a) sys.is_finalizing() == True -> no-op
+        eng_a = handle.QFEngineHandle.create(fake_qf_lib, "/fake/a.safetensors", {"model_arch": "krea2"})
+        eng_a._sys = types.SimpleNamespace(is_finalizing=lambda: True)
+        eng_a.__del__()
+        assert fake_qf_lib.destroyed == []
+        assert eng_a.xfm is not None
+        eng_a._sys = sys
+        eng_a.destroy()
+
+        # (b) sys is None -> no-op
+        eng_b = handle.QFEngineHandle.create(fake_qf_lib, "/fake/b.safetensors", {"model_arch": "krea2"})
+        eng_b._sys = None
+        with monkeypatch.context() as mp:
+            mp.setattr(handle, "sys", None)
+            eng_b.__del__()
+        assert len(fake_qf_lib.destroyed) == 1
+        assert eng_b.xfm is not None
+        eng_b._sys = sys
+        eng_b.destroy()
+
+        # (c) _reference_audio_pending == True -> no-op
+        eng_c = handle.QFEngineHandle.create(fake_qf_lib, "/fake/c.safetensors", {"model_arch": "ltx25"})
+        eng_c.retain_reference_audio(object())
+        eng_c.__del__()
+        assert len(fake_qf_lib.destroyed) == 2
+        assert eng_c.xfm is not None
+        assert eng_c.reference_audio_pending() is True
+        eng_c.reference_audio_copy_completed()
+        eng_c._reference_audio_owner = None
+        eng_c.destroy()
+
+        # (d) _destroy_lock held on another thread -> non-blocking immediate return without deadlock
+        eng_d = handle.QFEngineHandle.create(fake_qf_lib, "/fake/d.safetensors", {"model_arch": "krea2"})
+        other_locked = threading.Event()
+        release_other = threading.Event()
+
+        def _hold_lock() -> None:
+            eng_d._destroy_lock.acquire()
+            try:
+                other_locked.set()
+                release_other.wait(timeout=5.0)
+            finally:
+                eng_d._destroy_lock.release()
+
+        holder = threading.Thread(target=_hold_lock)
+        holder.start()
+        try:
+            assert other_locked.wait(timeout=5.0)
+            eng_d.__del__()
+            assert len(fake_qf_lib.destroyed) == 3
+            assert eng_d.xfm is not None
+        finally:
+            release_other.set()
+            holder.join(timeout=5.0)
+        eng_d.destroy()
+        assert len(fake_qf_lib.destroyed) == 4
+
+        # (d2) _destroying=True reentrancy guard & __del__ TOCTOU double-check + exception isolation
+        eng_toctou = handle.QFEngineHandle.create(fake_qf_lib, "/fake/t.safetensors", {"model_arch": "krea2"})
+        eng_toctou._destroying = True
+        eng_toctou.__del__()
+        eng_toctou.destroy()
+        eng_toctou._destroy_for_shutdown()
+        assert len(fake_qf_lib.destroyed) == 4
+        assert eng_toctou.xfm is not None
+        eng_toctou._destroying = False
+
+        class _ToctouLock:
+            def __init__(self, inner: threading.RLock, mutator: Any) -> None:
+                self._inner = inner
+                self._mutator = mutator
+                self.released = False
+
+            def acquire(self, blocking: bool = True) -> bool:
+                if self._inner.acquire(blocking=blocking):
+                    self._mutator()
+                    return True
+                return False
+
+            def release(self) -> None:
+                self.released = True
+                self._inner.release()
+
+        # TOCTOU case 1: _reference_audio_pending flipped True between outer check and post-lock check
+        real_lock_t = eng_toctou._destroy_lock
+        tlock1 = _ToctouLock(real_lock_t, lambda: setattr(eng_toctou, "_reference_audio_pending", True))
+        eng_toctou._destroy_lock = tlock1  # type: ignore[assignment]
+        eng_toctou.__del__()
+        assert tlock1.released is True
+        assert len(fake_qf_lib.destroyed) == 4
+        assert eng_toctou.xfm is not None
+        eng_toctou._reference_audio_pending = False
+
+        # TOCTOU case 2: xfm cleared to None between outer check and post-lock check
+        saved_xfm = eng_toctou.xfm
+        tlock2 = _ToctouLock(real_lock_t, lambda: setattr(eng_toctou, "xfm", None))
+        eng_toctou._destroy_lock = tlock2  # type: ignore[assignment]
+        eng_toctou.__del__()
+        assert tlock2.released is True
+        assert len(fake_qf_lib.destroyed) == 4
+        eng_toctou.xfm = saved_xfm
+        eng_toctou._destroy_lock = real_lock_t
+        eng_toctou.destroy()
+        assert len(fake_qf_lib.destroyed) == 5
+
+        # __del__ exception isolation when qf_xfm_destroy raises inside __del__
+        del_err_lib = FakeQFLib()
+
+        def _del_boom(xfm: Any) -> None:
+            raise RuntimeError("del-boom")
+
+        del_err_lib.qf_xfm_destroy = _del_boom
+        eng_del_err = handle.QFEngineHandle.create(del_err_lib, "/fake/de.safetensors", {"model_arch": "krea2"})
+        eng_del_err.__del__()
+        assert eng_del_err.xfm is None
+        assert eng_del_err._destroying is False
+        assert eng_del_err._destroy_lock._is_owned() is False
+        with handle._LIVE_HANDLES_LOCK:
+            assert eng_del_err not in handle._LIVE_HANDLES
+
+        # end_session_if_open exception branch + retain_reference_audio double-retain branch
+        sess_err_lib = FakeQFLib()
+        eng_sess = handle.QFEngineHandle.create(sess_err_lib, "/fake/se.safetensors", {"model_arch": "ltx25"})
+        sess = eng_sess.session_begin(512, 512, 4, (1, 16, 64), capi.QF_DTYPE_BF16)
+        sess_err_lib.qf_xfm_session_end = lambda s: (_ for _ in ()).throw(RuntimeError("sess-end-boom"))
+        assert eng_sess.end_session_if_open() == (True, False)
+        assert eng_sess.current_session == sess
+        eng_sess.retain_reference_audio(_TrackableOwner())
+        with pytest.raises(RuntimeError, match="prior reference-audio"):
+            eng_sess.retain_reference_audio(_TrackableOwner())
+        eng_sess.reference_audio_copy_completed()
+        eng_sess._reference_audio_owner = None
+        eng_sess.destroy()
+
+        # (e) object.__new__(QFEngineHandle) with ONLY lib & xfm set across ALL teardown methods
+        xfm1 = handle.create_transformer(fake_qf_lib, weights_path="/fake/e1.safetensors", config_json={"model_arch": "krea2"})
+        h1 = object.__new__(handle.QFEngineHandle)
+        h1.lib = fake_qf_lib
+        h1.xfm = xfm1
+        assert h1.end_session_if_open() == (False, True)
+        assert h1.reference_audio_pending() is False
+        h1.destroy()
+        assert h1.xfm is None
+        assert len(fake_qf_lib.destroyed) == 6
+
+        xfm2 = handle.create_transformer(fake_qf_lib, weights_path="/fake/e2.safetensors", config_json={"model_arch": "krea2"})
+        h2 = object.__new__(handle.QFEngineHandle)
+        h2.lib = fake_qf_lib
+        h2.xfm = xfm2
+        h2._destroy_for_shutdown()
+        assert h2.xfm is None
+        assert len(fake_qf_lib.destroyed) == 7
+
+        xfm3 = handle.create_transformer(fake_qf_lib, weights_path="/fake/e3.safetensors", config_json={"model_arch": "krea2"})
+        h3 = object.__new__(handle.QFEngineHandle)
+        h3.lib = fake_qf_lib
+        h3.xfm = xfm3
+        h3.__del__()
+        assert h3.xfm is None
+        assert len(fake_qf_lib.destroyed) == 8
+
+        # (e.1) object.__new__ with active current_session + normal FakeQFLib (QF_OK) across ALL 4 methods
+        for idx in range(4):
+            xfm_ok = handle.create_transformer(
+                fake_qf_lib,
+                weights_path=f"/fake/ok_{idx}.safetensors",
+                config_json={"model_arch": "krea2"},
+            )
+            bpx = capi.QFSessionBeginParams(
+                struct_size=ctypes.sizeof(capi.QFSessionBeginParams),
+                width=512,
+                height=512,
+                num_steps=4,
+                max_context_dims=(ctypes.c_int32 * 3)(1, 16, 64),
+                cond_dtype=capi.QF_DTYPE_BF16,
+            )
+            sess_ok = ctypes.c_void_p()
+            assert fake_qf_lib.qf_xfm_session_begin(xfm_ok, ctypes.byref(bpx), ctypes.byref(sess_ok)) == capi.QF_OK
+            h_ok = object.__new__(handle.QFEngineHandle)
+            h_ok.lib = fake_qf_lib
+            h_ok.xfm = xfm_ok
+            h_ok.current_session = sess_ok
+            if idx == 0:
+                assert h_ok.end_session_if_open() == (True, True)
+                assert h_ok.current_session is None
+                h_ok.destroy()
+            elif idx == 1:
+                h_ok.destroy()
+            elif idx == 2:
+                h_ok._destroy_for_shutdown()
+            else:
+                h_ok.__del__()
+            assert h_ok.current_session is None
+            assert h_ok.xfm is None
+        assert len(fake_qf_lib.destroyed) == 12
+
+        # (e.2) object.__new__ with _reference_audio_pending=True + _reference_audio_owner across destroy/__del__/_destroy_for_shutdown
+        pending_lib = FakeQFLib(fail_session_end_status=capi.QF_ERR_INTERNAL)
+        pending_lib.qf_xfm_unload_vram = lambda *a: (_ for _ in ()).throw(RuntimeError("unload boom"))
+        xfm_p = handle.create_transformer(pending_lib, weights_path="/fake/p.safetensors", config_json={"model_arch": "ltx25"})
+        owner_p = _TrackableOwner()
+        ref_p = weakref.ref(owner_p)
+        h_p = object.__new__(handle.QFEngineHandle)
+        h_p.lib = pending_lib
+        h_p.xfm = xfm_p
+        h_p._reference_audio_pending = True
+        h_p._reference_audio_owner = owner_p
+        del owner_p
+
+        with pytest.raises(RuntimeError, match="pending"):
+            h_p.destroy()
+        assert h_p.xfm is not None
+        h_p.__del__()
+        assert h_p.xfm is not None
+        assert pending_lib.destroyed == []
+
+        observed_p: dict[str, bool] = {}
+        orig_p_destroy = pending_lib.qf_xfm_destroy
+
+        def _spy_p_destroy(xfm_arg: Any) -> None:
+            observed_p["owner_alive"] = ref_p() is not None
+            orig_p_destroy(xfm_arg)
+
+        pending_lib.qf_xfm_destroy = _spy_p_destroy
+        h_p._destroy_for_shutdown()
+        gc.collect()
+        assert observed_p == {"owner_alive": True}
+        assert ref_p() is None
+        assert h_p.xfm is None
+        assert h_p.reference_audio_pending() is False
+        assert len(pending_lib.destroyed) == 1
+
+        # object.__new__ with open current_session and stub/None lib lacking C-API methods
+        class _StubLib:
+            pass
+
+        for idx, stub_lib in enumerate((_StubLib(), None)):
+            h_stub = object.__new__(handle.QFEngineHandle)
+            h_stub.lib = stub_lib
+            h_stub.xfm = 0x9000 + idx
+            h_stub.current_session = 0x8000 + idx
+            assert h_stub.end_session_if_open() == (True, False)
+            assert h_stub.reference_audio_pending() is False
+            if idx == 0:
+                h_stub.destroy()
+            else:
+                h_stub._destroy_for_shutdown()
+            assert h_stub.xfm is None
+            h_stub.__del__()
+    finally:
+        _drain_live_handles_for_test()
+
+
+def test_s08_version_bump_l0_zero_torch_and_0_0_19_compat_matrix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import quantfunc
+
+    assert quantfunc.__version__ == "0.1.1"
+    assert installer.ENGINE_COMPAT_VERSION == "0.0.08"
+
+    # L0 pure-stdlib direct import check with torch + all 7 optional deps blocked
+    repo_root = Path(__file__).resolve().parent.parent
+    l0_script = """
+import sys
+
+BLOCKED = (
+    "diffusers",
+    "transformers",
+    "accelerate",
+    "huggingface_hub",
+    "modelscope",
+    "fastapi",
+    "uvicorn",
+    "torch",
+)
+for mod in BLOCKED:
+    sys.modules[mod] = None
+
+import quantfunc.native.handle as h
+
+for mod in BLOCKED:
+    assert sys.modules.get(mod) is None, f"Blocked dependency imported by quantfunc.native.handle: {mod}"
+
+destroyed = []
+class _Lib:
+    def qf_xfm_destroy(self, xfm):
+        destroyed.append(xfm)
+
+eng = h.QFEngineHandle(_Lib(), 777)
+assert eng in h._LIVE_HANDLES
+h._shutdown_all_handles()
+assert eng.xfm is None and destroyed == [777]
+"""
+    env = dict(os.environ)
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    env["PYTHONPATH"] = str(repo_root) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    proc = subprocess.run(
+        [sys.executable, "-c", l0_script],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+    assert proc.stderr == ""
+
+    # 0.0.19 backward-compatibility matrix across linux & win32, cu12 & cu13
+    entry_017 = {
+        "comfy": "0.0.07",
+        "comfy-12": "0.0.07",
+        "sdk": "0.0.07",
+        "sdk-12": "0.0.07",
+        "lib": "0.0.17",
+        "lib-12": "0.0.17",
+        "kernel_so": True,
+    }
+    entry_018 = {
+        "comfy": "0.0.08",
+        "comfy-12": "0.0.08",
+        "sdk": "0.0.08",
+        "sdk-12": "0.0.08",
+        "lib": "0.0.18",
+        "lib-12": "0.0.18",
+        "kernel_so": True,
+    }
+    entry_019 = {
+        "comfy": "0.0.08",
+        "comfy-12": "0.0.08",
+        "sdk": "0.0.08",
+        "sdk-12": "0.0.08",
+        "lib": "0.0.19",
+        "lib-12": "0.0.19",
+        "kernel_so": True,
+    }
+    full_manifest = {
+        "linux": {"0.0.17": dict(entry_017), "0.0.18": dict(entry_018), "0.0.19": dict(entry_019)},
+        "win32": {"0.0.17": dict(entry_017), "0.0.18": dict(entry_018), "0.0.19": dict(entry_019)},
+    }
+    monkeypatch.delenv("QF_ENGINE_COMPAT_VERSION", raising=False)
+    for plat_key in ("linux", "win32"):
+        versions = full_manifest[plat_key]
+        for cu_major in (13, 12):
+            assert installer._engine_pick_version(versions, installer._engine_compat_version(), cu_major) == "0.0.19"
+            assert installer._engine_pick_version(versions, "0.0.07", cu_major) == "0.0.17"
+            assert installer._engine_pick_version({"0.0.18": entry_018, "0.0.19": entry_019}, "0.0.07", cu_major) is None
+
+    monkeypatch.setenv("QF_ENGINE_COMPAT_VERSION", "0.0.07")
+    assert installer._engine_pick_version(full_manifest["linux"], installer._engine_compat_version(), 13) == "0.0.17"
+    assert installer._engine_pick_version({"0.0.19": entry_019}, installer._engine_compat_version(), 12) is None
+    monkeypatch.delenv("QF_ENGINE_COMPAT_VERSION", raising=False)
+
+    # End-to-end installer mock upgrade 0.0.18 -> 0.0.19 with 7-key schema (zero addons)
+    base_url = "https://releases.quantfunc.example/engine"
+    monkeypatch.setattr(installer, "_BIN_SUBDIR", "linux")
+    monkeypatch.setattr(installer, "_torch_cuda_major", lambda: 13)
+    monkeypatch.setattr(installer, "_driver_cuda_major", lambda: 13)
+    monkeypatch.setattr(installer, "_gpu_sm", lambda idx=0: 89)
+    monkeypatch.setattr(installer.platform, "machine", lambda: "x86_64")
+    monkeypatch.delenv("QF_NATIVE_SO_PATH", raising=False)
+
+    eng_dir = tmp_path / "upgrade_019"
+    r18, _, _ = _make_mock_release(version="0.0.18", version_entry_extra={"sdk": "0.0.08", "sdk-12": "0.0.08"}, base_url=base_url)
+    monkeypatch.setattr(installer, "_engine_http_open", lambda url: _FakeHttpResponse(url, r18[url]))
+    res18 = installer.install_engine(engine_dir=eng_dir, base_url=base_url)
+    assert res18 is not None and res18["version"] == "0.0.18"
+
+    r19, host19, _ = _make_mock_release(version="0.0.19", version_entry_extra={"sdk": "0.0.08", "sdk-12": "0.0.08"}, base_url=base_url)
+    monkeypatch.setattr(installer, "_engine_http_open", lambda url: _FakeHttpResponse(url, r19[url]))
+    res19 = installer.install_engine(engine_dir=eng_dir, base_url=base_url)
+    assert res19 is not None and res19["version"] == "0.0.19"
+    assert Path(installer.resolve_so_path(engine_dir=eng_dir)).read_bytes() == host19
+
+
+def test_mutation_s_m1_m2_m3_lifecycle_and_compat(
+    fake_qf_lib: FakeQFLib,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_root = Path(__file__).resolve().parent.parent
+
+    # S-M1: unregistering atexit handler causes surviving globals to skip pre-finalizing cleanup (S06 turns RED)
+    sm1_script = """
+import atexit
+import sys
+
+events = []
+
+def _report():
+    print(f"count={len(events)}")
+
+atexit.register(_report)
+
+import quantfunc.native.handle as h
+atexit.unregister(h._shutdown_all_handles)
+
+class _StubLib:
+    def qf_xfm_destroy(self, xfm):
+        events.append((xfm, sys.is_finalizing()))
+
+_KEEP = [h.QFEngineHandle(_StubLib(), 101), h.QFEngineHandle(_StubLib(), 102)]
+"""
+    env = dict(os.environ)
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    env["PYTHONPATH"] = str(repo_root) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    proc = subprocess.run([sys.executable, "-c", sm1_script], env=env, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0
+    assert "count=0" in proc.stdout
+
+    # S-M2: swapping WeakSet to strong set leaks handle after del + gc.collect() (S01 turns RED)
+    _drain_live_handles_for_test()
+    strong_set: set[Any] = set()
+    monkeypatch.setattr(handle, "_LIVE_HANDLES", strong_set)
+    try:
+        eng = handle.QFEngineHandle.create(fake_qf_lib, "/fake/sm2.safetensors", {"model_arch": "krea2"})
+        ref = weakref.ref(eng)
+        del eng
+        gc.collect()
+        assert ref() is not None  # S01 assertion `assert ref() is None` would turn RED!
+    finally:
+        strong_set.clear()
+        monkeypatch.undo()
+        _drain_live_handles_for_test()
+
+    # S-M3: mutating 0.0.19 manifest sdk requirement to "0.0.09" breaks 0.0.08 SDK resolution (S08 turns RED)
+    mutated_manifest = {
+        "0.0.18": {"comfy": "0.0.08", "sdk": "0.0.08", "lib": "0.0.18", "kernel_so": True},
+        "0.0.19": {"comfy": "0.0.08", "sdk": "0.0.09", "sdk-12": "0.0.09", "lib": "0.0.19", "lib-12": "0.0.19", "kernel_so": True},
+    }
+    assert installer._engine_pick_version(mutated_manifest, "0.0.08", 13) != "0.0.19"
+    assert installer._engine_pick_version(mutated_manifest, "0.0.08", 12) != "0.0.19"
+    monkeypatch.setattr(installer, "ENGINE_COMPAT_VERSION", "0.0.09")
+    with pytest.raises(AssertionError):
+        assert installer.ENGINE_COMPAT_VERSION == "0.0.08"
+
+
+def test_s09_cyclic_gc_reentrancy_and_zero_lock_nesting(monkeypatch: pytest.MonkeyPatch) -> None:
+    import torch
+
+    from quantfunc.models.base import QuantFuncBaseTransformer
+
+    _drain_live_handles_for_test()
+    old_thresh = gc.get_threshold()
+    tracked_locks: list[threading.RLock] = []
+    nesting_violations: list[str] = []
+
+    class _NoNestRLock:
+        def __init__(self) -> None:
+            self._inner = threading.RLock()
+
+        def acquire(self, blocking: bool = True) -> bool:
+            for dlock in tracked_locks:
+                if dlock._is_owned():
+                    nesting_violations.append("acquired _LIVE_HANDLES_LOCK while _destroy_lock was owned")
+            return self._inner.acquire(blocking=blocking)
+
+        def release(self) -> None:
+            self._inner.release()
+
+        def __enter__(self) -> bool:
+            return self.acquire()
+
+        def __exit__(self, *args: Any) -> None:
+            self.release()
+
+        def _is_owned(self) -> bool:
+            return self._inner._is_owned()
+
+    no_nest_lock = _NoNestRLock()
+    monkeypatch.setattr(handle, "_LIVE_HANDLES_LOCK", no_nest_lock)
+
+    def _run_with_timeout(fn: Any) -> None:
+        errs: list[BaseException] = []
+
+        def _runner() -> None:
+            try:
+                fn()
+            except BaseException as exc:  # noqa: BLE001
+                errs.append(exc)
+
+        t = threading.Thread(target=_runner)
+        t.start()
+        t.join(timeout=5.0)
+        assert not t.is_alive(), "Deadlock detected in cyclic GC handle teardown!"
+        assert errs == []
+
+    try:
+        # (1) Cyclic QuantFuncBaseTransformer (with open session) + self-referencing L0 QFEngineHandle under gc(1, 0, 0) during _shutdown_all_handles()
+        lib1 = FakeQFLib()
+        orig_destroy1 = lib1.qf_xfm_destroy
+        orig_sess_end1 = lib1.qf_xfm_session_end
+
+        def _checked_destroy1(xfm: Any) -> None:
+            if no_nest_lock._is_owned():
+                nesting_violations.append("_LIVE_HANDLES_LOCK owned inside qf_xfm_destroy")
+            orig_destroy1(xfm)
+
+        def _checked_sess_end1(sess: Any) -> int:
+            if no_nest_lock._is_owned():
+                nesting_violations.append("_LIVE_HANDLES_LOCK owned inside qf_xfm_session_end")
+            return orig_sess_end1(sess)
+
+        lib1.qf_xfm_destroy = _checked_destroy1
+        lib1.qf_xfm_session_end = _checked_sess_end1
+
+        h_keep = handle.QFEngineHandle.create(lib1, "/fake/cyc_keep.safetensors", {"model_arch": "krea2"})
+        h_model = handle.QFEngineHandle.create(lib1, "/fake/cyc_model.safetensors", {"model_arch": "krea2"})
+        h_self = handle.QFEngineHandle.create(lib1, "/fake/cyc_self.safetensors", {"model_arch": "krea2"})
+        tracked_locks.extend([h_keep._destroy_lock, h_model._destroy_lock, h_self._destroy_lock])
+
+        m_cyc = QuantFuncBaseTransformer(handle=h_model, config={"model_arch": "krea2"}, torch_dtype=torch.float32)
+        h_model.session_begin(512, 512, 4, (1, 16, 64), capi.QF_DTYPE_BF16)
+        h_model.retain_reference_audio(_TrackableOwner())
+        h_self._self_cycle = h_self  # type: ignore[attr-defined]
+        h_self_ref = weakref.ref(h_self)
+        m_cyc_ref = weakref.ref(m_cyc)
+
+        del m_cyc
+        del h_self
+        del h_model
+
+        def _phase1() -> None:
+            gc.set_threshold(1, 0, 0)
+            try:
+                handle._shutdown_all_handles()
+                gc.collect()
+            finally:
+                gc.set_threshold(*old_thresh)
+
+        _run_with_timeout(_phase1)
+        assert nesting_violations == []
+        assert h_keep.xfm is None
+        assert m_cyc_ref() is None
+        assert h_self_ref() is None
+        assert len(lib1.destroyed) == 3
+
+        # (2a) Synchronous nested destroy depth >= 2: call h_outer.destroy() directly (outside GC)
+        #      and drop cyclic handles inside qf_xfm_destroy so inner __del__/destroy runs at depth >= 2
+        lib2a = FakeQFLib()
+        orig_destroy2a = lib2a.qf_xfm_destroy
+        nested_lib = FakeQFLib()
+        orig_nested_destroy = nested_lib.qf_xfm_destroy
+        max_observed_depth = 0
+
+        def _spy_nested_destroy(xfm: Any) -> None:
+            nonlocal max_observed_depth
+            max_observed_depth = max(max_observed_depth, handle._thread_destroy_depth())
+            orig_nested_destroy(xfm)
+
+        nested_lib.qf_xfm_destroy = _spy_nested_destroy
+
+        h_outer = handle.QFEngineHandle.create(lib2a, "/fake/outer2a.safetensors", {"model_arch": "krea2"})
+        h_nested = handle.QFEngineHandle.create(nested_lib, "/fake/nested_self.safetensors", {"model_arch": "krea2"})
+        h_nested_m = handle.QFEngineHandle.create(nested_lib, "/fake/nested_model.safetensors", {"model_arch": "krea2"})
+        tracked_locks.extend([h_outer._destroy_lock, h_nested._destroy_lock, h_nested_m._destroy_lock])
+        h_nested._self_cycle = h_nested  # type: ignore[attr-defined]
+        m_nested = QuantFuncBaseTransformer(handle=h_nested_m, config={"model_arch": "krea2"}, torch_dtype=torch.float32)
+        nested_ref = weakref.ref(h_nested)
+        nested_m_ref = weakref.ref(m_nested)
+        nested_box: list[Any] = [h_nested, m_nested]
+        del h_nested, h_nested_m, m_nested
+
+        def _nested_gc_inside_destroy(xfm: Any) -> None:
+            if no_nest_lock._is_owned():
+                nesting_violations.append("_LIVE_HANDLES_LOCK owned inside _nested_gc_inside_destroy")
+            if nested_box:
+                nested_box.clear()
+            gc.collect()
+            orig_destroy2a(xfm)
+
+        lib2a.qf_xfm_destroy = _nested_gc_inside_destroy
+        _run_with_timeout(h_outer.destroy)
+
+        assert max_observed_depth >= 2
+        assert nesting_violations == []
+        assert h_outer.xfm is None
+        assert nested_ref() is None
+        assert nested_m_ref() is None
+        assert len(lib2a.destroyed) == 1
+        assert len(nested_lib.destroyed) == 2
+        with no_nest_lock:
+            assert len(handle._LIVE_HANDLES) == 0
+
+        # (2b) Cyclic QuantFuncBaseTransformer + self-referencing QFEngineHandle under gc(1, 0, 0) during h.destroy() / _destroy_for_shutdown()
+        lib2 = FakeQFLib()
+        orig_destroy2 = lib2.qf_xfm_destroy
+
+        h_outer2 = handle.QFEngineHandle.create(lib2, "/fake/outer.safetensors", {"model_arch": "krea2"})
+        h_inner_self = handle.QFEngineHandle.create(lib2, "/fake/inner_self.safetensors", {"model_arch": "krea2"})
+        h_shutdown = handle.QFEngineHandle.create(lib2, "/fake/shut_reent.safetensors", {"model_arch": "ltx25"})
+        tracked_locks.extend([h_outer2._destroy_lock, h_inner_self._destroy_lock, h_shutdown._destroy_lock])
+
+        m_same = QuantFuncBaseTransformer(handle=h_outer2, config={"model_arch": "krea2"}, torch_dtype=torch.float32)
+        h_inner_self._self_cycle = h_inner_self  # type: ignore[attr-defined]
+        m_same_ref = weakref.ref(m_same)
+        h_inner_ref = weakref.ref(h_inner_self)
+
+        m_shut = QuantFuncBaseTransformer(handle=h_shutdown, config={"model_arch": "ltx25"}, torch_dtype=torch.float32)
+        h_shutdown.retain_reference_audio(_TrackableOwner())
+        m_shut_ref = weakref.ref(m_shut)
+
+        del m_same
+        del h_inner_self
+        del m_shut
+
+        def _gc_inside_destroy(xfm: Any) -> None:
+            if no_nest_lock._is_owned():
+                nesting_violations.append("_LIVE_HANDLES_LOCK owned inside _gc_inside_destroy")
+            gc.collect()
+            orig_destroy2(xfm)
+
+        lib2.qf_xfm_destroy = _gc_inside_destroy
+
+        def _phase2() -> None:
+            gc.set_threshold(1, 0, 0)
+            try:
+                h_outer2.destroy()
+                h_shutdown._destroy_for_shutdown()
+                gc.collect()
+            finally:
+                gc.set_threshold(*old_thresh)
+
+        _run_with_timeout(_phase2)
+        assert nesting_violations == []
+        assert h_outer2.xfm is None
+        assert h_shutdown.xfm is None
+        assert m_same_ref() is None
+        assert h_inner_ref() is None
+        assert m_shut_ref() is None
+        assert len(lib2.destroyed) == 3
+
+        # (3) Mid-snapshot reentrant destroy() & reference_audio_copy_completed() under _REGISTRY_SNAPSHOT_DEPTH > 0
+        #     plus raising end_session_if_open() inside _destroy_for_shutdown()
+        lib3 = FakeQFLib()
+        lib3.qf_xfm_unload_vram = lambda *a: (_ for _ in ()).throw(RuntimeError("unload3"))
+        h_s1 = handle.QFEngineHandle.create(lib3, "/fake/s1.safetensors", {"model_arch": "ltx25"})
+        h_s2 = handle.QFEngineHandle.create(lib3, "/fake/s2.safetensors", {"model_arch": "ltx25"})
+        h_s3 = handle.QFEngineHandle.create(lib3, "/fake/s3.safetensors", {"model_arch": "krea2"})
+        tracked_locks.extend([h_s1._destroy_lock, h_s2._destroy_lock, h_s3._destroy_lock])
+        h_s1.retain_reference_audio(_TrackableOwner())
+        h_s2.retain_reference_audio(_TrackableOwner())
+
+        def _boom_end_session() -> tuple[bool, bool]:
+            raise RuntimeError("boom end_session_if_open")
+
+        orig_s1_end = h_s1.end_session_if_open
+        end_calls = 0
+
+        def _s1_end_once() -> tuple[bool, bool]:
+            nonlocal end_calls
+            end_calls += 1
+            if end_calls == 1:
+                return _boom_end_session()
+            return orig_s1_end()
+
+        h_s1.end_session_if_open = _s1_end_once  # type: ignore[method-assign]
+
+        real_ws = handle._LIVE_HANDLES
+        triggered = False
+
+        class _MidIterWeakSetProxy:
+            def __iter__(self) -> Any:
+                nonlocal triggered
+                for item in real_ws:
+                    yield item
+                    if not triggered:
+                        triggered = True
+                        h_s3.destroy()
+                        h_s2.reference_audio_copy_completed()
+                        h_s2._reference_audio_owner = None
+
+            def discard(self, item: Any) -> None:
+                real_ws.discard(item)
+
+            def add(self, item: Any) -> None:
+                real_ws.add(item)
+
+            def clear(self) -> None:
+                real_ws.clear()
+
+            def __len__(self) -> int:
+                return len(real_ws)
+
+            def __contains__(self, item: Any) -> bool:
+                return item in real_ws
+
+        with monkeypatch.context() as mp:
+            mp.setattr(handle, "_LIVE_HANDLES", _MidIterWeakSetProxy())
+            _run_with_timeout(handle._shutdown_all_handles)
+
+        assert triggered is True
+        assert nesting_violations == []
+        assert h_s1.xfm is None and h_s2.xfm is None and h_s3.xfm is None
+        assert len(lib3.destroyed) == 3
+
+        # Verify registries completely empty
+        with no_nest_lock:
+            assert len(handle._LIVE_HANDLES) == 0
+            assert len(handle._REFERENCE_AUDIO_PENDING_OWNERS) == 0
+    finally:
+        gc.set_threshold(*old_thresh)
+        monkeypatch.undo()
+        _drain_live_handles_for_test()

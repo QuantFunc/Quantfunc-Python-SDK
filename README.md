@@ -12,7 +12,7 @@
 
 # QuantFunc Python SDK
 
-Drop-in, layered Python acceleration runtime for image, video, and audio-video diffusion pipelines built on `torch` and `diffusers`, powered by **QuantFunc PC Engine `0.0.18`** (`4.0–5.5 MiB` native engine download on Linux; `14.0–17.6 MiB` on Windows for RTX 40/50 series and `21.8–28.3 MiB` for `sm75`/`sm86`).
+Drop-in, layered Python acceleration runtime for image, video, and audio-video diffusion pipelines built on `torch` and `diffusers`, powered by **QuantFunc PC Engine `0.0.19`** (`4.0–5.5 MiB` native engine download on Linux; `14.0–17.6 MiB` on Windows for RTX 40/50 series and `21.8–28.3 MiB` for `sm75`/`sm86`).
 
 - **Pure-Python wheel (`py3-none-any`)**: lightweight `torch>=2.4` core with [`requirements.txt`](requirements.txt) and optional extras for `diffusers`, `transformers`, HuggingFace Hub, and ModelScope.
 - **1–3 line drop-in**: replace a pipeline's `transformer` with a `QuantFunc*Transformer` and keep the rest of your `diffusers` workflow intact.
@@ -98,7 +98,7 @@ pip install -r requirements.txt
 pip install --no-deps -e .
 
 # Option B: Direct install from GitHub (PEP 508 syntax, pip >= 25 compatible)
-pip install "quantfunc[all] @ git+https://github.com/QuantFunc/Quantfunc-Python-SDK.git@v0.1.0"
+pip install "quantfunc[all] @ git+https://github.com/QuantFunc/Quantfunc-Python-SDK.git@v0.1.1"
 
 # Optional: pre-download native engine binaries (4–28 MiB per GPU) into ~/.cache/quantfunc/engine
 quantfunc install-engine

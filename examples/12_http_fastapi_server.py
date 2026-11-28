@@ -614,7 +614,7 @@ def build_app(
         max_media_bytes=max_media_bytes,
     )
 
-    app = FastAPI(title="QuantFunc Online Serving API", version="0.1.0")
+    app = FastAPI(title="QuantFunc Online Serving API", version="0.1.1")
 
     @app.get("/health")
     async def health_endpoint() -> Any:
